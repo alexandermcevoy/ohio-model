@@ -1,34 +1,40 @@
 """
 classify.py — District tier classification and targeting framework.
 
-Tiers are based on composite partisan lean. Swing SD and turnout elasticity
-are computed from contested house races only. Districts with fewer than 2
-contested races are flagged (n_contested < 2) — one data point isn't enough
-for a reliable swing estimate.
+Tiers are based on **win probability** at reference statewide environments,
+following Cook/Sabato convention (Safe D → Safe R). Composite lean is kept
+as a raw number — no lean-threshold bucketing.
+
+Swing SD and turnout elasticity are computed from contested house races only.
+Districts with fewer than 2 contested races are flagged (n_contested < 2).
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 from src.constants import LITERATURE_INCUMBENCY_ADVANTAGE  # kept for reference; not wired to calculations
 
 # ---------------------------------------------------------------------------
-# Tier thresholds
+# Win-probability tier thresholds (Cook-style)
 # ---------------------------------------------------------------------------
 
-TIER_THRESHOLDS: dict[str, tuple[float, float]] = {
-    "safe_d":   (+0.15, float("inf")),
-    "likely_d": (+0.08, +0.15),
-    "lean_d":   (+0.03, +0.08),
-    "tossup":   (-0.03, +0.03),
-    "lean_r":   (-0.08, -0.03),
-    "likely_r": (-0.15, -0.08),
-    "safe_r":   (float("-inf"), -0.15),
-}
+WP_TIER_THRESHOLDS: list[tuple[str, float, float]] = [
+    # (tier_name, wp_lower_bound_inclusive, wp_upper_bound_exclusive)
+    ("safe_d",   0.95, float("inf")),
+    ("likely_d", 0.75, 0.95),
+    ("lean_d",   0.55, 0.75),
+    ("tossup",   0.45, 0.55),
+    ("lean_r",   0.25, 0.45),
+    ("likely_r", 0.05, 0.25),
+    ("safe_r",   0.00, 0.05),
+]
 
 TIER_ORDER = ["safe_d", "likely_d", "lean_d", "tossup", "lean_r", "likely_r", "safe_r"]
+
+REFERENCE_ENVIRONMENTS: list[float] = [0.46, 0.48, 0.50]
 
 # Flip threshold at or below which a pickup is achievable in a strong D midterm year.
 # 52% is above any statewide D share Ohio Democrats have hit since 2006; it captures
@@ -59,22 +65,108 @@ OPEN_SEATS_2026: dict[int, dict[str, str]] = {
 # UPDATE THIS as new retirements/filing-deadline announcements arrive.
 
 
-def assign_tier(lean: float) -> str:
-    for tier, (lo, hi) in TIER_THRESHOLDS.items():
+def assign_tier_from_wp(win_prob: float) -> str:
+    """Map a D win probability to a Cook-style tier label."""
+    for tier, lo, hi in WP_TIER_THRESHOLDS:
+        if lo <= win_prob < hi:
+            return tier
+    return "safe_r"
+
+
+# Legacy lean-based tier assignment — kept for backward compat in drop-one
+# sensitivity (where we care about composite robustness, not projected outcomes).
+_LEAN_TIER_THRESHOLDS: dict[str, tuple[float, float]] = {
+    "safe_d":   (+0.15, float("inf")),
+    "likely_d": (+0.08, +0.15),
+    "lean_d":   (+0.03, +0.08),
+    "tossup":   (-0.03, +0.03),
+    "lean_r":   (-0.08, -0.03),
+    "likely_r": (-0.15, -0.08),
+    "safe_r":   (float("-inf"), -0.15),
+}
+
+
+def _assign_tier_from_lean(lean: float) -> str:
+    """Legacy: map composite lean to tier via fixed thresholds."""
+    for tier, (lo, hi) in _LEAN_TIER_THRESHOLDS.items():
         if lo <= lean < hi:
             return tier
     return "safe_r"
+
+
+# Public alias for backward compatibility (used by composite.py drop-one, backtest.py)
+assign_tier = _assign_tier_from_lean
+
+
+def format_lean(lean: float) -> str:
+    """Format composite lean as 'D+3.3' / 'R+5.2' / 'EVEN' (Cook/Sabato style)."""
+    pts = lean * 100
+    if abs(pts) < 0.05:
+        return "EVEN"
+    if pts > 0:
+        return f"D+{pts:.1f}"
+    return f"R+{abs(pts):.1f}"
+
+
+def compute_wp_at_environment(
+    composite_lean: pd.Series,
+    sigma_i: pd.Series,
+    statewide_d: float,
+) -> pd.Series:
+    """Compute analytical D win probability at a given statewide environment.
+
+    P(D wins) = Φ((statewide_d + lean - 0.50) / sigma_i)
+    """
+    margin = statewide_d + composite_lean - 0.50
+    return pd.Series(norm.cdf(margin / sigma_i), index=composite_lean.index)
 
 
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
-def classify_districts(df: pd.DataFrame) -> pd.DataFrame:
-    """Add tier, current_holder, holder_matches_tier, pickup_opportunity, defensive_priority."""
+def classify_districts(
+    df: pd.DataFrame,
+    sigma_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Add tier columns, current_holder, holder_matches_tier, pickup_opportunity, defensive_priority.
+
+    If sigma_df is provided, tiers are based on win probability at reference
+    environments (Cook-style). Otherwise falls back to lean-threshold tiers.
+
+    Parameters
+    ----------
+    df : DataFrame with at least ``composite_lean`` and optionally ``winner_2024``.
+    sigma_df : DataFrame with columns ``district``, ``sigma_i`` from
+        ``simulate.estimate_district_sigma()``. When provided, enables
+        WP-based tier assignment at each reference environment.
+    """
     df = df.copy()
 
-    df["tier"] = df["composite_lean"].apply(assign_tier)
+    if sigma_df is not None:
+        # WP-based tiers at each reference environment
+        merged = df[["district", "composite_lean"]].merge(
+            sigma_df[["district", "sigma_i"]], on="district", how="left",
+        )
+        for env in REFERENCE_ENVIRONMENTS:
+            env_label = f"{int(env * 100)}"
+            wp = compute_wp_at_environment(
+                merged["composite_lean"], merged["sigma_i"], env,
+            )
+            df[f"wp_{env_label}"] = wp.values
+            df[f"tier_{env_label}"] = wp.apply(assign_tier_from_wp).values
+
+        # Primary tier = 48% environment (neutral midterm)
+        df["tier"] = df["tier_48"]
+    else:
+        # Legacy fallback: lean-threshold tiers
+        import warnings
+        warnings.warn(
+            "classify_districts() called without sigma_df — using legacy "
+            "lean-threshold tiers. Pass sigma_df for WP-based tiers.",
+            DeprecationWarning, stacklevel=2,
+        )
+        df["tier"] = df["composite_lean"].apply(_assign_tier_from_lean)
 
     def _holder(winner: object) -> str:
         if pd.isna(winner):
@@ -102,11 +194,11 @@ def classify_districts(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
 
-    # Pickup: R-held district that the composite says is competitive
+    # Pickup: R-held district in competitive WP tier (at neutral environment)
     _pickup_tiers = {"lean_d", "tossup", "lean_r", "likely_d"}
     df["pickup_opportunity"] = (df["current_holder"] == "R") & df["tier"].isin(_pickup_tiers)
 
-    # Defensive: D-held tossup/lean_r, or D won by < 5 pts in 2024
+    # Defensive: D-held tossup/lean_r/lean_d, or D won by < 5 pts in 2024
     _def_tiers = {"tossup", "lean_r", "lean_d"}
     d_competitive = (df["current_holder"] == "D") & df["tier"].isin(_def_tiers)
     close_win = pd.Series(False, index=df.index)
@@ -227,6 +319,7 @@ def build_targeting_df(
     composite_df: pd.DataFrame,
     house_long: pd.DataFrame,
     candidate_names_2024: pd.DataFrame | None = None,
+    sigma_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Full targeting DataFrame: classify + swing metrics + flip threshold +
@@ -240,8 +333,11 @@ def build_targeting_df(
         [district, dem_candidate_2024, rep_candidate_2024] from
         extract_candidate_names(sos_2024). When provided, populates
         current_incumbent_name for non-open-seat districts.
+    sigma_df : optional DataFrame with columns [district, sigma_i] from
+        estimate_district_sigma(). When provided, tiers are based on
+        win probability at reference environments.
     """
-    df = classify_districts(composite_df)
+    df = classify_districts(composite_df, sigma_df=sigma_df)
     df = compute_swing_metrics(df, house_long)
 
     # Flip threshold: statewide D% at which this district becomes majority-D.
@@ -301,8 +397,19 @@ def build_targeting_df(
     cand_cols = []
     if candidate_names_2024 is not None:
         cand_cols = [c for c in ["dem_candidate_2024", "rep_candidate_2024"] if c in df.columns]
+
+    # WP tier columns at each reference environment
+    env_cols = []
+    for env in REFERENCE_ENVIRONMENTS:
+        env_label = f"{int(env * 100)}"
+        for prefix in ["tier_", "wp_"]:
+            col = f"{prefix}{env_label}"
+            if col in df.columns:
+                env_cols.append(col)
+
     base_cols = [
         "district", "composite_lean", "tier",
+    ] + env_cols + [
         "current_holder", "holder_matches_tier",
         "pickup_opportunity", "defensive_priority",
         "contested_2024", "margin_2024", "candidate_effect_2024",

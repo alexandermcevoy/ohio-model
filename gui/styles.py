@@ -66,10 +66,15 @@ def fmt_pct(value: float | None, decimals: int = 1) -> str:
 
 
 def fmt_lean(value: float | None) -> str:
-    """Format composite lean as '+X.XXX' or '-X.XXX'."""
+    """Format composite lean as 'D+3.3' / 'R+5.2' / 'EVEN' (Cook/Sabato style)."""
     if value is None:
         return "n/a"
-    return f"{value:+.3f}"
+    pts = value * 100
+    if abs(pts) < 0.05:
+        return "EVEN"
+    if pts > 0:
+        return f"D+{pts:.1f}"
+    return f"R+{abs(pts):.1f}"
 
 
 def lean_to_margin(lean: float, statewide_d: float) -> float:

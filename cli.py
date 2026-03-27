@@ -365,19 +365,44 @@ def run_classify(
     else:
         typer.echo(f"  NOTE: 2024 SOS file not found at {sos_2024_path}; candidate names unavailable.")
 
+    # ── Compute district uncertainty (sigma) for WP-based tiers ──────────────
+    typer.echo("\nComputing district uncertainty for WP-based tiers …")
+    from src.simulate import compute_sigma_prior, estimate_district_sigma
+    from src.classify import compute_swing_metrics as _csm
+
+    sigma_prior = compute_sigma_prior(composite_df)
+    typer.echo(f"  Sigma prior (pooled candidate effect std): {sigma_prior:.4f}")
+
+    # Compute swing metrics on a scratch copy so we can estimate sigma before
+    # the full classify pass.  compute_swing_metrics needs district + composite_lean.
+    _swing_tmp = _csm(composite_df.copy(), house_long)
+    sigma_df = estimate_district_sigma(_swing_tmp, sigma_prior)
+    typer.echo(f"  Sigma range: {sigma_df['sigma_i'].min():.4f} – {sigma_df['sigma_i'].max():.4f}")
+
     # ── Build targeting DataFrame ─────────────────────────────────────────────
     typer.echo("\nClassifying districts and computing swing metrics …")
-    targeting_df = build_targeting_df(composite_df, house_long, candidate_names_2024)
+    targeting_df = build_targeting_df(composite_df, house_long, candidate_names_2024, sigma_df=sigma_df)
 
     # ── Tier summary ──────────────────────────────────────────────────────────
-    typer.echo("\n--- Tier distribution ---")
-    from src.classify import TIER_ORDER
+    typer.echo("\n--- Tier distribution (at 48% statewide D — neutral midterm) ---")
+    from src.classify import TIER_ORDER, REFERENCE_ENVIRONMENTS
     tier_counts = targeting_df["tier"].value_counts()
     for tier in TIER_ORDER:
         n = tier_counts.get(tier, 0)
         held = targeting_df[targeting_df["tier"] == tier]["current_holder"].value_counts().to_dict()
         held_str = "  ".join(f"{p}:{c}" for p, c in sorted(held.items()))
         typer.echo(f"  {tier:12s} {n:3d} districts   [{held_str}]")
+
+    # Show tier counts at all reference environments
+    for env in REFERENCE_ENVIRONMENTS:
+        env_label = f"{int(env * 100)}"
+        tier_col = f"tier_{env_label}"
+        if tier_col in targeting_df.columns:
+            counts = targeting_df[tier_col].value_counts()
+            tossup_n = counts.get("tossup", 0)
+            lean_d_n = counts.get("lean_d", 0)
+            lean_r_n = counts.get("lean_r", 0)
+            typer.echo(f"  At {env_label}%: {tossup_n} tossup, {lean_d_n} lean_d, {lean_r_n} lean_r")
 
     n_pickup = targeting_df["pickup_opportunity"].sum()
     n_defense = targeting_df["defensive_priority"].sum()
@@ -1090,7 +1115,8 @@ def run_methodology(
     typer.echo("Key parameters:")
     typer.echo("  Composite races:     9 (2018–2024)")
     typer.echo("  Weighting basis:     Governor-year heavy (2022 gov = 22.7%)")
-    typer.echo("  Tier thresholds:     ±3 tossup / ±8 lean / ±15 likely / beyond safe")
+    typer.echo("  Tier system:         Win-probability at 46/48/50% statewide D")
+    typer.echo("  Tier thresholds:     Cook-style (>95% Safe, 75-95% Likely, 55-75% Lean, 45-55% Tossup)")
     typer.echo("  Regression:          GLM binomial/logit, clustered SEs by district")
     typer.echo("  D incumbency AME:    +6.7 pts")
     typer.echo("  R incumbency AME:    -6.1 pts")
@@ -2523,6 +2549,26 @@ def export_gui():
 
     typer.echo(f"\nExported {copied} files to gui_data/ ({missing} missing)")
     typer.echo("Dashboard data is ready for deployment.")
+
+
+@app.command("backtest")
+def run_backtest_cmd():
+    """
+    Session 12: Out-of-sample backtest — use pre-2024 data to predict 2024 outcomes.
+
+    Builds composite lean from 2016-2022 statewide races only (via block backbone),
+    classifies districts, estimates uncertainty from pre-2024 house results, and
+    compares predicted win probabilities against actual 2024 house race outcomes.
+    """
+    from src.backtest import run_backtest, write_backtest_report, write_backtest_csvs
+    from src.export import generate_backtest_one_pager
+
+    typer.echo("=== Ohio House Model — Session 12: Historical Backtest ===\n")
+    results = run_backtest()
+    write_backtest_report(results)
+    write_backtest_csvs(results)
+    generate_backtest_one_pager(results)
+    typer.echo("\nDone.")
 
 
 if __name__ == "__main__":

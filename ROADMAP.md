@@ -1,6 +1,6 @@
 # Ohio House Election Model — Roadmap
 
-*Last updated: March 26, 2026*
+*Last updated: March 27, 2026*
 
 ---
 
@@ -10,13 +10,16 @@ A durable analytical platform for Ohio state legislative elections that any Demo
 
 ---
 
-## Current State: v1.6 (Sessions 1–9 complete)
+## Current State: v2.3 (Sessions 1–13 complete)
 
-The analytical engine is operational, validated, and producing actionable outputs. What's built:
+The analytical engine is operational, validated, and producing actionable outputs — now with a block-level data backbone and a stakeholder-facing web GUI. What's built:
 
 - **Composite partisan lean** for all 99 Ohio House districts, validated against DRA (Spearman ρ = 0.9985). Built from 9 statewide races across 4 election cycles (2018–2024), crosswalked to current district geography via population-weighted precinct-to-district overlay.
+- **Census Block Backbone** (Session 10): 219,669 populated Census 2020 blocks as the canonical storage unit. Precinct votes disaggregated to blocks, then reaggregated to any district map on demand. 8 election years (2010–2024) ingested. Block-level vote surfaces validated against existing composite (max diff 0.003 pts). Redistricting contamination eliminated structurally.
+- **Per-district partisan trend** from 8 election cycles (2010–2024), computed from block vote surfaces. Trend slope, R², direction merged into targeting CSV.
+- **Stakeholder GUI** (Session 11): Streamlit multi-page dashboard with 5 views — Scenario Explorer, Pickup Portfolio, District Profiles, Map (choropleth), Investment Priority. Live recomputation via Monte Carlo when slider changes. Deployed on Streamlit Cloud.
 - **Three-map redistricting filter**: two-transition Jaccard overlap check (old→interim and interim→final) identifies which house election years are reliable per district. 13 districts have all 4 years; 73 have 2022+2024; 13 have only 2024.
-- **District classification** into 7 tiers (safe D → safe R) with targeting mode (persuasion / mobilization / hybrid / structural / insufficient_data).
+- **District classification** into 7 win-probability tiers (Cook-style: Safe D → Safe R) at three reference environments (46/48/50% statewide D). Composite lean kept as raw number (D+/R+ format). Session 13 overhauled terminology to align with political convention.
 - **Probabilistic Monte Carlo scenario model** (10,000 sims per environment) with Empirical Bayes district-level uncertainty, analytical win probabilities, marginal win probability for investment prioritization, path-to-target optimizer, and defensive scenarios.
 - **Pickup portfolio classification**: Core (7 districts viable across all plausible 2026 environments), Stretch (5 districts viable in good cycles), Long-Shot (6 districts, wave only). Three open seats (31, 52, 35) are highest-value opportunities.
 - **Voter file integration**: Ohio SOS voter file (~7.9M records) scored for partisan lean, turnout propensity, and presidential-only status. Per-district mobilization and persuasion universes. Contact export for field use.
@@ -26,61 +29,45 @@ The analytical engine is operational, validated, and producing actionable output
 - **PDF district profiles** for all 99 districts — includes probabilistic outlook, voter universe, open seat status, redistricting status, anomaly flags.
 - **Validation suite**: anomaly detection, drop-one sensitivity, external DRA validation, 2024 backtest, monotonicity checks.
 - **Methodology document v3.0** (`reports/methodology.md`, 15 sections) — fully current.
-- **CLI** with simulate, invest, win-prob, session8, voters, report, targets, scenario, defense, open-seats, and more.
+- **CLI** with simulate, invest, win-prob, session8, voters, report, targets, scenario, defense, open-seats, backbone, trends, and more.
 
 **Known limitations:**
-- House race results joined by district number, not geometry — redistricting filter mitigates contamination but is a bandaid, not architectural. Block backbone solves this structurally.
-- Historical data limited to 2018–2024. No long-term trend context (2000–2016) to assess whether current competitive leans are durable or transient.
+- County-level historical data (2010–2014) is coarser than precinct-level (88 counties vs ~9k precincts). Acceptable for trend analysis but not for fine-grained district profiling.
 - Incumbency cannot be estimated from Ohio data (2-cycle post-redistricting panel); literature prior (6 pts) used optionally.
-- All outputs are CLI-only. Stakeholders need technical assistance to explore the model.
+- VEST 2022/2024 shapefiles not yet acquired (subscription required). Currently using SOS→VEST 2020 precinct join for those years (98–99% match rate).
+- Voter file not yet geocoded to blocks — still uses district assignment from voter registration, not centroid mapping.
 
 ---
 
-## Next: v2.0 — Block Backbone Architecture (Session 10)
+## Completed: v2.0 — Block Backbone Architecture (Session 10) ✅
 
-The foundational infrastructure upgrade. Makes Census blocks the canonical storage unit. Every election's precinct results are disaggregated to blocks, then reaggregated to any district map on demand.
-
-**What it solves:**
-- **Redistricting contamination eliminated structurally** — historical data maps to current geography through blocks, not district numbers. The Jaccard filter becomes unnecessary.
-- **Future redistricting (2032) is a one-command reaggregation**, not a rebuild. All historical data is instantly available on new maps.
-- **Long-term trend analysis unlocked** — county-level 2000–2016 results can be ingested and disaggregated to blocks, giving 25+ years of partisan trajectory context at the district level.
-- **Adding new election years is a single ingest step**, not a new crosswalk.
-- **Voter file plugs directly into the block layer** — geocoded addresses map to blocks, enabling exact (not population-weighted) vote allocation.
-
-**What it requires:**
-- Census 2020 block shapefile with population (~300k Ohio blocks).
-- VEST precinct shapefiles for each election year (have 2020; 2018 free from VEST; 2022/2024 require subscription).
-- County-level results for 2000–2016 (freely available from Ohio SOS / Dave Leip's Atlas).
-- Computational resources for block-precinct spatial joins (manageable with county-by-county chunking — already proven in pop-weight table build).
-
-**What it produces:**
-- `data/processed/block_vote_surface_{year}.parquet` — one row per (block, race), canonical storage format.
-- `src/backbone.py` — block disaggregation, reaggregation engine, county-level historical ingest.
-- Updated composite lean pipeline routing through block layer instead of direct precinct-to-district crosswalk.
-- County-level trend analysis outputs: 25-year partisan trajectories for all 88 Ohio counties.
+Census 2020 blocks (~220k populated) as the canonical storage unit. 8 election years (2010–2024) disaggregated to blocks. Validated against existing composite (max diff 0.003 pts). Per-district partisan trend (2010–2024) computed and merged into targeting. See CLAUDE.md Session 10 log for details.
 
 ---
 
-## Next: v2.1 — Stakeholder GUI (Session 11)
+## Completed: v2.1 — Stakeholder GUI (Session 11) ✅
 
-The analytical layer is mature. The bottleneck is access — stakeholders can't explore the model without running CLI commands and reading CSVs. A web-based GUI turns the platform into a tool operatives can actually use.
+Streamlit multi-page dashboard with 5 views: Scenario Explorer, Pickup Portfolio, District Profiles, Map (choropleth), Investment Priority. Live Monte Carlo recomputation. Deployed on Streamlit Cloud. See CLAUDE.md Session 11 log for details.
 
-**Core views:**
-- **Scenario Explorer** — slider for statewide D%, live-updating seat distribution chart, probability thresholds (P(≥34), P(≥40), P(majority)), and the pickup portfolio at that environment.
-- **District Profiles** — interactive version of the PDF profiles. Click a district to see composite lean, win probability curve, voter universe, demographics, house race history, candidate effects.
-- **Pickup Portfolio** — the S-curve chart from `pickup_portfolio.png`, interactive. Hover for district details. Filter by core/stretch/long-shot.
-- **Map View** — choropleth of composite lean, tier, win probability, or demographic variables. Click-to-drill into district profiles.
-- **Investment Priority** — ranked list with marginal WP, sortable/filterable. Path-to-target optimizer visualization.
+---
 
-**Framework considerations:**
-- Streamlit is the most likely choice — lightweight, Python-native, reads directly from existing pandas DataFrames and CSVs. No frontend build step. Deploys easily for a single-user or small-team context.
-- Alternatives: Panel/HoloViz (more flexibility, steeper learning curve), Dash (Plotly-native, heavier). Streamlit wins on speed-to-useful.
-- The GUI reads from the same CSV/parquet outputs the CLI produces. No separate data pipeline — run `session8` or `simulate` to refresh, then the GUI picks up the latest files.
+## Completed: v2.2 — Historical Backtest (Session 12) ✅
 
-**What it does NOT do (intentionally):**
-- No user accounts or auth (single-analyst tool shared with a small team).
-- No data editing through the GUI — all data flows through the CLI pipeline.
-- No real-time updates — refresh by re-running the pipeline, not by polling.
+Out-of-sample validation: pre-2024 composite (2016–2022 only) predicts 2024 house outcomes. 98% binary accuracy, 94.9% competitive district accuracy, Brier skill 0.878, actual 34 seats in MC 80% CI [30, 35]. Only 2 misclassifications (both D candidate overperformance in lean_d districts). See CLAUDE.md Session 12 log for details.
+
+---
+
+## Completed: v2.3 — Tier Terminology Overhaul (Session 13) ✅
+
+Tiers changed from composite-lean-threshold-based to win-probability-based (Cook-style). Tiers shown at three reference environments: 46% (bad cycle), 48% (neutral midterm), 50% (good cycle). Composite lean kept as raw number with D+/R+ display format. Eliminates confusion where "Lean D" implied a projected win but actually described relative partisan position. See CLAUDE.md Session 13 log for details.
+
+---
+
+## Next: Data Acquisition + Extensions
+
+### Data Acquisition
+- **County-level results 2000–2008** (free, Ohio SOS) — extends trend analysis to 25 years. The backbone already handles county-level disaggregation (proven with 2010–2014).
+- **VEST 2022/2024 shapefiles** (subscription required) — enables geometry-aware block disaggregation for post-redistricting cycles, replacing the current SOS→VEST 2020 precinct join.
 
 ---
 
@@ -100,17 +87,17 @@ The current greedy optimizer and marginal WP ranking are sufficient for strategi
 
 | Data | Source | Cost | Priority | Unlocks |
 |------|--------|------|----------|---------|
-| County-level results 2000–2016 | Ohio SOS / Dave Leip's Atlas | Free | **High** | Long-term trend analysis via block backbone — 25 years of partisan realignment |
-| VEST 2022/2024 shapefiles | UF Election Lab (subscription) | TBD | **High** | Block backbone for post-redistricting cycles, geometry-aware house results |
-| VEST 2018 shapefile | UF Election Lab (free) | Free | **High** | Block backbone for 2018 cycle |
-| Census 2020 block shapefile | Census Bureau | Free | **High** | Block backbone foundation (~300k Ohio blocks) |
+| County-level results 2000–2008 | Ohio SOS / Dave Leip's Atlas | Free | **High** | Extend trend analysis to 25 years (2010–2016 already ingested) |
+| VEST 2022/2024 shapefiles | UF Election Lab (subscription) | TBD | **High** | Geometry-aware block disaggregation for post-redistricting cycles |
+| ~~VEST 2018 shapefile~~ | ~~UF Election Lab (free)~~ | ~~Free~~ | ~~Done~~ | ~~Ingested in Session 10~~ |
+| ~~Census 2020 block shapefile~~ | ~~Census Bureau~~ | ~~Free~~ | ~~Done~~ | ~~219,669 blocks loaded in Session 10~~ |
 | Follow the Money campaign finance | followthemoney.org | Free | Medium | Spending data for regression, disentangle candidate quality |
 | L2 modeled voter file | L2 Inc. | $$$ | Low | Pre-modeled partisan scores — less needed now that we have SOS voter file scored |
 | Census 2030 blocks | Census Bureau | Free (2031) | Future | Required for post-2030 redistricting |
 
 ---
 
-## Future Sessions (Post-v2.1)
+## Future Sessions (Post-v2.2)
 
 ### Ohio Senate Extension
 - Same methodology applied to Ohio Senate (33 districts, 4-year staggered terms).
@@ -141,28 +128,22 @@ The current greedy optimizer and marginal WP ranking are sufficient for strategi
 ## Architecture Evolution
 
 ```
-v1.6 (current)          v2.0 (block backbone)     v2.1+ (GUI + extensions)
-──────────────          ─────────────────────     ──────────────────────────
-Precincts → Districts   Precincts → Blocks →      Same backbone +
-                        Districts                  web-based exploration
+v1.6 (Sessions 1–9)    v2.0 (Session 10)         v2.1 (Session 11)         v2.2+ (next)
+──────────────────      ─────────────────         ─────────────────         ────────────
+Precincts → Districts   Precincts → Blocks →      Same backbone +           Backtest validation,
+                        Districts                  Streamlit GUI             deeper history
 
-Population-weighted     Same crosswalk,            Streamlit GUI reads
-block centroid join     generalized to             from backbone outputs
+Population-weighted     Same crosswalk,            GUI reads from            Out-of-sample
+block centroid join     generalized to             backbone outputs          predictive test
                         any district map
 
-House results by        House results via          Interactive district
-district number         block reaggregation        profiles, scenario
+House results by        House results via          Interactive district      Pre-2024 composite
+district number         block reaggregation        profiles, scenario        predicts 2024
 (redistricting-         (structurally              explorer, maps
 filtered)               contamination-free)
 
-Single district map     Any district map           Any district map
-                        on demand                  on demand
-
-4 election cycles       25 years of history        25 years + stakeholder
-(2018–2024)             (2000–2024)                self-service access
-
-Voter file scored       Voter file geocoded        Voter universe visible
-but not geocoded        to blocks                  in GUI district profiles
+4 election cycles       8 election cycles          Stakeholder self-         25 years of history
+(2018–2024)             (2010–2024)                service access            (2000–2024)
 ```
 
 ---
@@ -214,11 +195,12 @@ The tool is successful if:
 4. ☑ Session 7 — validation suite, methodology v2.0, CLAUDE.md data schema
 5. ☑ Session 8 — voter file integration
 6. ☑ Session 9 — probabilistic scenarios, pickup portfolio, resource allocation
-7. ☐ Acquire Census 2020 block shapefile + VEST 2018 shapefile
-8. ☐ Check VEST subscription pricing for 2022/2024 shapefiles
-9. ☐ Acquire county-level results 2000–2016
-10. ☐ **Session 10 — block backbone architecture**
-11. ☐ **Session 11 — stakeholder GUI**
+7. ☑ Session 10 — block backbone architecture (2010–2024, 8 election years)
+8. ☑ Session 11 — stakeholder GUI (Streamlit, deployed to Cloud)
+9. ☑ Session 12 — historical backtest (98% accuracy, Brier skill 0.878)
+10. ☑ Session 13 — tier terminology overhaul (WP-based tiers, Cook-style)
+11. ☐ Acquire county-level results 2000–2008
+11. ☐ Check VEST subscription pricing for 2022/2024 shapefiles
 12. ☐ Future sessions as priorities dictate
 
 ---

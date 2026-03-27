@@ -52,10 +52,11 @@ for _, row in targeting.sort_values("district").iterrows():
     d = int(row["district"])
     tier_label = TIER_LABELS.get(row.get("tier", ""), "")
     lean = row.get("composite_lean", 0)
-    margin = lean_to_margin(lean, selected_d)
+    lean_pts = lean * 100
+    lean_str = f"D+{lean_pts:.1f}" if lean_pts > 0.05 else (f"R+{abs(lean_pts):.1f}" if lean_pts < -0.05 else "EVEN")
     holder = row.get("current_holder", "?")
     open_tag = " [OPEN]" if row.get("open_seat_2026", False) else ""
-    selector_options.append(f"District {d} — {tier_label} — {fmt_margin(margin)} ({holder}){open_tag}")
+    selector_options.append(f"District {d} — {tier_label} — {lean_str} ({holder}){open_tag}")
 
 # Default to District 52 if available, else first
 default_idx = 0
@@ -104,7 +105,15 @@ bcol1, bcol2, bcol3, bcol4, bcol5 = st.columns(5)
 
 with bcol1:
     tier = data["tier"]
-    st.markdown(f"**Tier:** {tier_badge(tier)}", unsafe_allow_html=True)
+    st.markdown(f"**Tier (48%):** {tier_badge(tier)}", unsafe_allow_html=True)
+    # Show all three environment tiers if available
+    row_data = targeting[targeting["district"] == district]
+    if not row_data.empty:
+        r = row_data.iloc[0]
+        t46 = TIER_LABELS.get(r.get("tier_46", ""), "")
+        t50 = TIER_LABELS.get(r.get("tier_50", ""), "")
+        if t46 and t50:
+            st.caption(f"46%: {t46} · 50%: {t50}")
 
 with bcol2:
     margin = lean_to_margin(data["composite_lean"], selected_d)

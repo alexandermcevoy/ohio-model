@@ -53,6 +53,9 @@ python cli.py backbone --full --force          # rebuild all cached parquets fro
 python cli.py trends                           # compute + merge into targeting CSV
 python cli.py trends --force                   # recompute from block vote surfaces
 
+# Session 12 — historical backtest (pre-2024 → predict 2024)
+python cli.py backtest                         # full out-of-sample backtest
+
 # Individual modules can be imported and called independently:
 python -c "from src.ingest_sos import load_sos_file; f = load_sos_file('data/raw/statewide-races-by-precinct.xlsx')"
 ```
@@ -141,7 +144,7 @@ This tool is being built to become durable analytical infrastructure for Ohio De
 **Full vision and positioning:** See `VISION.md` for the strategic case, 
 intended audience, and pitch framing. See `roadmap.md` for execution plan.
 
-**Current state (v1.6):** Composite partisan lean validated against DRA (ρ = 0.9985), 7-tier district classification, fundamentals-only uniform swing scenarios + probabilistic Monte Carlo scenarios with district-level uncertainty, GLM regression (exploratory), ACS demographics, voter file integration, resource allocation optimizer, PDF district profiles with probabilistic outlook, CLI, anomaly detection, drop-one sensitivity, full three-map redistricting filter, CLAUDE.md data schema.
+**Current state (v2.3):** Composite partisan lean validated against DRA (ρ = 0.9985), win-probability tiers at 3 reference environments (Cook-style), fundamentals-only uniform swing scenarios + probabilistic Monte Carlo scenarios with district-level uncertainty, GLM regression (exploratory), ACS demographics, voter file integration, resource allocation optimizer, PDF district profiles with probabilistic outlook, Streamlit GUI, historical backtest (98% accuracy), CLI, anomaly detection, drop-one sensitivity, full three-map redistricting filter, CLAUDE.md data schema.
 
 **Next (v2.0): Block Backbone Architecture** — Census blocks become the canonical storage unit, eliminating redistricting contamination structurally and enabling instant reaggregation to any district map. Also unlocks ingestion of county-level 2000–2016 historical data for long-term trend analysis. This is the infrastructure foundation that makes everything else durable.
 
@@ -241,6 +244,8 @@ All primary analytical outputs live in `reports/` and `data/processed/`. Source 
 | `data/processed/block_district_map_2024.parquet` | one row/block | ~220k | `block_geoid` |
 | `data/processed/block_votes_{year}.parquet` | long, block × race | variable | `block_geoid`, `race` |
 | `data/processed/oh_house_district_trends.csv` | wide, one row/district | 99 | `district` |
+| `reports/session12/backtest_district_predictions.csv` | wide, one row/district | 99 | `district` |
+| `reports/session12/backtest_composite_comparison.csv` | wide, one row/district | 99 | `district` |
 
 The **primary analytical join** is `targeting.csv ← composite_lean.csv ← redistricting_overlap.csv`, all on `district`. The targeting CSV already contains the most-used columns from composite lean.
 
@@ -254,10 +259,16 @@ After running `voters --build`, the targeting CSV also contains voter-file-deriv
 |---|---|---|
 | `district` | int | Ohio House district number, 1–99 |
 | `composite_lean` | float | Weighted composite partisan lean (D − statewide). Positive = more D. Range: −0.20 to +0.43 |
-| `tier` | str | safe_d / likely_d / lean_d / tossup / lean_r / likely_r / safe_r |
+| `tier` | str | Win-probability tier at 48% statewide D (neutral midterm). Cook-style: safe_d (>95% WP) / likely_d (75–95%) / lean_d (55–75%) / tossup (45–55%) / lean_r (25–45%) / likely_r (5–25%) / safe_r (<5%) |
+| `tier_46` | str | Win-probability tier at 46% statewide D (bad cycle) |
+| `wp_46` | float | D win probability at 46% statewide D |
+| `tier_48` | str | Win-probability tier at 48% statewide D (= `tier` column) |
+| `wp_48` | float | D win probability at 48% statewide D |
+| `tier_50` | str | Win-probability tier at 50% statewide D (good cycle) |
+| `wp_50` | float | D win probability at 50% statewide D |
 | `current_holder` | str | D or R (2024 winner) |
 | `holder_matches_tier` | bool | Whether 2024 winner matches tier prediction |
-| `pickup_opportunity` | bool | R-held district in tossup, lean_r, or likely_r tier |
+| `pickup_opportunity` | bool | R-held district in competitive WP tier at 48% statewide D |
 | `defensive_priority` | bool | D-held district in competitive tier |
 | `flip_threshold` | float | Statewide D share needed to flip = 0.50 − composite_lean |
 | `realistic_target` | bool | R-held district where flip_threshold ≤ 0.52 — achievable in a strong D year. Excludes lean_r and deeper structural long-shots from the primary pickup ladder |
@@ -771,7 +782,7 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 
 ### Session 3: District Classification & Targeting ✅
 - New modules: `src/classify.py`, `src/scenarios.py`; new CLI command: `python cli.py classify`
-- Tiered all 99 districts (safe_d → safe_r) using ±3/8/15-pt composite lean thresholds.
+- Tiered all 99 districts (safe_d → safe_r). Originally used ±3/8/15-pt composite lean thresholds; updated in Session 13 to win-probability tiers at three reference environments (46/48/50% statewide D).
 - Computed swing SD and turnout elasticity per district from contested house races; assigned target modes (persuasion/mobilization/hybrid/structural).
 - Uniform swing model: flip_threshold = 0.50 − composite_lean for each district.
 - Output: `reports/session3/oh_house_targeting.csv`, `reports/session3/oh_house_scenario_table.csv`, `reports/session3/oh_house_pickup_ladder.txt`
@@ -882,6 +893,31 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - 5 pages: Scenario Explorer, Pickup Portfolio, District Profiles, Map (choropleth), Investment Priority.
 - Live recomputation via `src/simulate.py` when slider differs from reference environment.
 - `streamlit run app.py` launches the dashboard.
+
+### Session 12: Historical Backtest ✅
+- New module: `src/backtest.py`; new CLI command: `python cli.py backtest`
+- **Out-of-sample test**: builds composite lean from 2016–2022 block vote surfaces only (no 2024 data), then predicts 2024 house outcomes at the actual 2024 statewide D share (44.3%).
+- **Pre-2024 weights**: DEFAULT_WEIGHTS with 2024 keys removed; `build_composite()` redistributes proportionally. Effective weights: gov2022 29.4%, statewide_avg2022 17.6%, pre2020 17.6%, gov2018 17.6%, statewide_avg2018 11.8%, uss 2.9% each.
+- **Composite stability**: pre-2024 vs full composite correlation = 0.9996, mean |Δ lean| = 0.004, max = 0.013, 6 tier changes. The composite is highly stable without 2024 data.
+- **Binary accuracy**: 98.0% overall (97/99), 97.6% contested-only (81/83). Only 2 misclassifications: Districts 23 and 10 (both lean_d, predicted R, actually D — candidate overperformance).
+- **Competitive district accuracy**: 94.9% (37/39 in tossup/lean tiers).
+- **Seat count**: actual 34 D seats within MC 80% CI [30, 35] and 50% CI [31, 34]. MC mean = 32.5.
+- **Probabilistic quality**: Brier score 0.026 (all), Brier skill score 0.878 vs naive baseline. Spearman ρ = 0.970 (win_prob vs actual dem_share).
+- **Calibration**: model is slightly conservative in the 0.3–0.8 WP range (underpredicts D wins), consistent with D candidates outperforming fundamentals in some competitive districts.
+- Output: `reports/session12/backtest_summary.txt`, `reports/session12/backtest_district_predictions.csv`, `reports/session12/backtest_composite_comparison.csv`.
+- **Credibility claim**: the model would have correctly identified 37 of 39 competitive district outcomes using only pre-2024 data. The 2 misses were D candidates overperforming lean_d fundamentals — the kind of candidate effect a fundamentals-only model cannot predict in advance.
+
+### Session 13: Tier Terminology Overhaul ✅
+- **Problem**: tier labels (Lean D, Lean R, etc.) were based on composite lean thresholds (±3/8/15 pts), but in political jargon "Lean D" implies a projected outcome (~55% chance D wins). District 52 was labeled "Lean D" but predicted R at the 2024 statewide environment — confusing.
+- **Fix**: tiers are now **win-probability based** (Cook-style) at three reference environments:
+  - 46% statewide D (bad cycle), 48% (neutral midterm), 50% (good cycle)
+  - Safe D (>95% WP), Likely D (75–95%), Lean D (55–75%), Tossup (45–55%), Lean R (25–45%), Likely R (5–25%), Safe R (<5%)
+- **Primary `tier` column** = tier at 48% (neutral midterm). Also: `tier_46`, `tier_48`, `tier_50`, `wp_46`, `wp_48`, `wp_50`.
+- **Composite lean** remains as a raw number — no more bucketing into lean-threshold tiers. Displayed as D+3.3 / R+5.2 (Cook/Sabato style) in human-readable contexts.
+- **Implementation**: `classify_districts()` now accepts optional `sigma_df`; if provided, computes WP tiers. Legacy lean-based fallback with deprecation warning.
+- `format_lean()` helper in `src/classify.py` and `_fmt_lean_cook()` in `src/export.py` for D+/R+ display.
+- GUI `fmt_lean()` updated to Cook format.
+- **Key dependency**: classify now requires sigma (district uncertainty) for WP tiers. The `classify` CLI command computes sigma from composite_lean_df before classification.
 
 ### Deferred: Natural Language Query Interface
 - Claude API integration — pushed back; unnecessary for current stakeholder needs.
