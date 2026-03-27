@@ -1,0 +1,14 @@
+geopandas
+pandas
+shapely
+pyproj
+fiona
+typer
+openpyxl
+anthropic
+pyarrow
+scipy
+statsmodels
+matplotlib
+streamlit
+plotly
