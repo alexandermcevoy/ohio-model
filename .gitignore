@@ -1,0 +1,13 @@
+data/raw/
+data/processed/
+data/shapefiles/
+data/voterfiles/
+reports/
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+.env
+.claude/
