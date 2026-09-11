@@ -49,7 +49,17 @@ class SimConfig:
 
 @dataclass
 class SimResult:
-    """Container for simulation outputs at a single statewide environment."""
+    """
+    Container for simulation outputs.
+
+    `statewide_d` is always a float — the fixed environment for a point
+    simulation, or the mean of `environment_samples` when the environment
+    itself was drawn from a distribution (see `run_simulations`).
+    `environment_samples` is None for a point simulation and holds the raw
+    per-simulation environment draws otherwise (e.g. from
+    `national_to_state.build_environment_prior()`), so a caller can recover
+    the full input distribution, not just its mean.
+    """
 
     statewide_d: float
     n_sims: int
@@ -67,6 +77,10 @@ class SimResult:
     p75_seats: int
     p90_seats: int
     std_seats: float
+
+    # None for a point simulation; the raw per-simulation environment draws
+    # (e.g. from national_to_state.build_environment_prior()) otherwise.
+    environment_samples: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +196,36 @@ def compute_incumbency_shifts(
 def run_simulations(
     targeting_df: pd.DataFrame,
     sigma_df: pd.DataFrame,
-    statewide_d: float,
+    statewide_d: float | np.ndarray,
     config: SimConfig | None = None,
 ) -> SimResult:
     """
-    Run N Monte Carlo simulations at a fixed statewide D share.
+    Run N Monte Carlo simulations of the chamber.
+
+    `statewide_d` is either:
+      - a scalar (e.g. 0.48) — a POINT simulation: every simulation uses the
+        same fixed environment, and only district-level noise varies. This
+        is the existing behavior (scenario tables, win-prob curves,
+        investment priority, defensive scenarios all use this mode) and its
+        results are unchanged by this parameter now accepting an array too.
+      - a 1-D array of pre-drawn environment samples (e.g. from
+        national_to_state.build_environment_prior(), or
+        governor.build_baseline_distribution()) — a DISTRIBUTION simulation:
+        each simulation draws its own statewide environment from the array
+        (one sample per simulation, in order) IN ADDITION to its own
+        district-level noise. This produces an UNCONDITIONAL seat
+        distribution that integrates over environment uncertainty, rather
+        than the conditional "if the environment is exactly X%" answer a
+        scalar gives. `config.n_sims` is ignored in this mode — the sample
+        count is set by `len(statewide_d)` so every environment draw is used
+        exactly once.
 
     For each simulation:
       1. Draw district-specific noise: epsilon_i ~ N(0, sigma_i)
       2. Optionally draw incumbency noise per sim
       3. District D share = statewide_d + composite_lean_i + inc_i + epsilon_i
+         (statewide_d is either the fixed scalar or that simulation's own
+         environment draw)
       4. District goes D if d_share > 0.50
       5. Count total D seats
 
@@ -200,11 +234,26 @@ def run_simulations(
     targeting_df : must contain columns: district, composite_lean, current_holder,
                    incumbent_status_2026
     sigma_df : from estimate_district_sigma(), columns: district, sigma_i
-    statewide_d : statewide D two-party share (e.g. 0.48)
+    statewide_d : statewide D two-party share (scalar) or an array of
+                  pre-drawn environment samples (distribution mode)
     config : simulation config
     """
     if config is None:
         config = SimConfig()
+
+    sw_arr = np.asarray(statewide_d, dtype=float)
+    if sw_arr.ndim == 0:
+        n_sims = config.n_sims
+        sw_col = sw_arr  # scalar broadcasts against (n_sims, n_districts) as-is
+        environment_samples = None
+    elif sw_arr.ndim == 1:
+        if sw_arr.size == 0:
+            raise ValueError("statewide_d array must be non-empty")
+        n_sims = sw_arr.size
+        sw_col = sw_arr[:, np.newaxis]
+        environment_samples = sw_arr.copy()
+    else:
+        raise ValueError(f"statewide_d must be a scalar or 1-D array, got shape {sw_arr.shape}")
 
     rng = np.random.default_rng(config.random_seed)
 
@@ -223,19 +272,20 @@ def run_simulations(
 
     # Monte Carlo draws
     # epsilon: (n_sims, n_districts)
-    epsilon = rng.normal(0.0, 1.0, size=(config.n_sims, n_districts)) * sigmas[np.newaxis, :]
+    epsilon = rng.normal(0.0, 1.0, size=(n_sims, n_districts)) * sigmas[np.newaxis, :]
 
     # Incumbency noise (if enabled, add per-sim noise around the literature value)
     if config.include_incumbency:
-        inc_noise = rng.normal(0.0, config.incumbency_sd, size=(config.n_sims, n_districts))
+        inc_noise = rng.normal(0.0, config.incumbency_sd, size=(n_sims, n_districts))
         # Only apply noise to districts with nonzero incumbency shift
         inc_mask = (inc_base != 0.0).astype(float)
         inc_total = inc_base[np.newaxis, :] + inc_noise * inc_mask[np.newaxis, :]
     else:
-        inc_total = np.zeros((config.n_sims, n_districts))
+        inc_total = np.zeros((n_sims, n_districts))
 
-    # District D share per simulation
-    d_shares = statewide_d + leans[np.newaxis, :] + inc_total + epsilon
+    # District D share per simulation (sw_col is either a scalar or shape
+    # (n_sims, 1) — both broadcast correctly against (n_sims, n_districts))
+    d_shares = sw_col + leans[np.newaxis, :] + inc_total + epsilon
 
     # D wins if d_share >= 0.50 (matches deterministic convention: flip_threshold <= sw_d)
     d_wins = d_shares >= 0.50
@@ -252,8 +302,8 @@ def run_simulations(
     seat_counts = d_wins.sum(axis=1)
 
     return SimResult(
-        statewide_d=statewide_d,
-        n_sims=config.n_sims,
+        statewide_d=float(sw_arr.mean()),
+        n_sims=n_sims,
         config=config,
         district_win_prob=district_wp,
         seat_counts=seat_counts,
@@ -264,6 +314,7 @@ def run_simulations(
         p75_seats=int(np.percentile(seat_counts, 75)),
         p90_seats=int(np.percentile(seat_counts, 90)),
         std_seats=float(seat_counts.std()),
+        environment_samples=environment_samples,
     )
 
 
@@ -336,15 +387,34 @@ def compute_analytical_win_probs(
     sigma_df: pd.DataFrame,
     statewide_d: float,
     config: SimConfig | None = None,
+    environment_sigma: float = 0.0,
 ) -> pd.DataFrame:
     """
     Compute per-district win probability and marginal WP analytically.
 
-    Uses the normal CDF: P(win) = Φ(margin / sigma_i)
-    Marginal WP = φ(margin / sigma_i) / sigma_i
+    Uses the normal CDF: P(win) = Φ(margin / total_sigma)
+    Marginal WP = φ(margin / total_sigma) / total_sigma
+
+    `environment_sigma` defaults to 0.0 — the original behavior, treating
+    `statewide_d` as a known point (every existing caller: scenario tables,
+    win-prob curves, `build_investment_priority`, defensive scenarios). Pass
+    a nonzero value to instead treat `statewide_d` as the MEAN of an
+    uncertain environment (e.g. forecast_statewide.build_forecast()'s
+    blended posterior) and fold that uncertainty into the district's total
+    margin sigma: district margin = environment + composite_lean + inc_shift
+    + district noise, and environment ~ N(statewide_d, environment_sigma) is
+    independent of district noise ~ N(0, sigma_i), so their sum is exactly
+    Normal with sigma = sqrt(environment_sigma^2 + sigma_i^2) — no need for
+    per-simulation arrays to get this right. `total_sigma` replaces `sigma_i`
+    as the win-prob and marginal-wp denominator only when this is nonzero;
+    Returned columns are unchanged from before this parameter existed
+    (`sigma_i` is always the district-only value — the combined sigma is an
+    internal computation, not a new column) so every existing consumer's
+    output schema, including the documented `investment_priority.csv`, is
+    byte-identical at the default `environment_sigma=0.0`.
 
     Returns DataFrame: district, composite_lean, margin, sigma_i,
-        win_prob, marginal_wp
+        inc_shift, win_prob, marginal_wp
     """
     if config is None:
         config = SimConfig()
@@ -357,9 +427,10 @@ def compute_analytical_win_probs(
     merged["inc_shift"] = merged["district"].map(inc_shifts).fillna(0.0)
 
     merged["margin"] = statewide_d + merged["composite_lean"] + merged["inc_shift"] - 0.50
-    merged["z_score"] = merged["margin"] / merged["sigma_i"]
+    total_sigma = np.sqrt(merged["sigma_i"]**2 + environment_sigma**2)
+    merged["z_score"] = merged["margin"] / total_sigma
     merged["win_prob"] = norm.cdf(merged["z_score"])
-    merged["marginal_wp"] = norm.pdf(merged["z_score"]) / merged["sigma_i"]
+    merged["marginal_wp"] = norm.pdf(merged["z_score"]) / total_sigma
 
     return merged[["district", "composite_lean", "margin", "sigma_i",
                     "inc_shift", "win_prob", "marginal_wp"]].copy()

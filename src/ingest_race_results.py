@@ -1,18 +1,28 @@
 """
-ingest_house_results.py — Aggregate actual Ohio State House race results by district.
+ingest_race_results.py — Aggregate SOS precinct-level race results to districts.
 
-Each precinct votes in exactly one House district, so no spatial crosswalk is
-needed: summing precinct rows within each district's vote columns gives district
-totals directly.
+Generalized from the original house-only `ingest_house_results.py`. Now supports
+state house, state senate, and U.S. House (congressional) races by dispatching
+on `OfficeConfig.sos_race_attr`, which names the field on `SosFile` to read
+from (`house`, `senate`, or `congressional`) and the matching precinct
+DataFrame (`precinct_house`, etc.).
 
-Important caveat: the 2018 and 2022 house races were conducted under different
-district maps than the current 2023 SOS plan. District numbers overlap but
-boundaries differ. This module reports results as-filed by district number;
-callers should interpret 2018/2022 results with this caveat in mind.
+Each precinct votes in exactly one legislative district at each office level,
+so no spatial crosswalk is needed: summing precinct rows within each district's
+vote columns gives district totals directly.
 
-Uncontested races (only D or only R candidate) are flagged explicitly.
-They cannot be used for partisan lean analysis but are useful as metadata
-(candidate filing patterns, organizational strength).
+Important caveat: pre-2022 results were filed under the prior maps. District
+numbers overlap but boundaries differ. This module reports results as-filed by
+district number; callers should interpret older results with this caveat in
+mind. The block backbone provides geometry-aware reaggregation as the
+authoritative cross-cycle path.
+
+Statewide / governor handling
+-----------------------------
+The governor and other statewide races aren't district-keyed — they live in
+`sos.statewide` keyed by short labels ('gov', 'uss', etc.). `parse_race_results`
+raises NotImplementedError for `office.is_statewide`; statewide results should
+be read directly off `sos.statewide` via the existing helpers.
 """
 
 from __future__ import annotations
@@ -22,28 +32,48 @@ from pathlib import Path
 import pandas as pd
 
 from src.ingest_sos import COUNTY_COL, PREC_CODE_COL, SosFile
+from src.office import OfficeConfig
 
 
-def parse_house_results(sos: SosFile) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+def parse_race_results(sos: SosFile, office: OfficeConfig) -> pd.DataFrame:
     """
-    Aggregate SOS precinct-level house data to the district level.
+    Aggregate SOS precinct-level race data for ONE office to the district level.
 
-    Returns DataFrame with columns:
-      year, district, dem_candidate_cols, rep_candidate_cols,
-      dem_votes, rep_votes, total_two_party, dem_share, margin,
-      winner (D/R/uncontested), contested (bool)
+    Parameters
+    ----------
+    sos : SosFile
+        Loaded by `load_sos_file`.
+    office : OfficeConfig
+        One of HOUSE, SENATE, CONGRESS. (GOVERNOR is statewide; raises.)
+
+    Returns
+    -------
+    DataFrame with columns:
+      year, district, dem_votes, rep_votes, total_two_party,
+      dem_share, margin, winner, contested
     """
+    if office.is_statewide:
+        raise NotImplementedError(
+            f"parse_race_results does not handle statewide office '{office.name}'. "
+            f"Read sos.statewide[{office.statewide_race_code!r}] directly."
+        )
+
+    race_attr = office.sos_race_attr
+    race_map: dict = getattr(sos, race_attr)
+    df: pd.DataFrame = getattr(sos, f"precinct_{race_attr}")
     year = sos.year
-    house_map = sos.house  # {district_num: RaceSpec}
-    df = sos.precinct_house
 
-    if df.empty or not house_map:
-        print(f"  No house data found for {year}.")
+    if df.empty or not race_map:
+        print(f"  No {office.display_name} data found for {year}.")
         return pd.DataFrame()
 
     records = []
-    for dist_num in sorted(house_map.keys()):
-        spec = house_map[dist_num]
+    for dist_num in sorted(race_map.keys()):
+        spec = race_map[dist_num]
 
         d_vote_cols = [c for c in spec.d_cols if c in df.columns]
         r_vote_cols = [c for c in spec.r_cols if c in df.columns]
@@ -94,13 +124,13 @@ def parse_house_results(sos: SosFile) -> pd.DataFrame:
 
     # Summary
     n_total = len(result)
-    n_contested = result["contested"].sum()
-    n_d = (result["winner"] == "D").sum()
-    n_r = (result["winner"] == "R").sum()
-    n_d_unc = (result["winner"] == "D_uncontested").sum()
-    n_r_unc = (result["winner"] == "R_uncontested").sum()
+    n_contested = int(result["contested"].sum())
+    n_d = int((result["winner"] == "D").sum())
+    n_r = int((result["winner"] == "R").sum())
+    n_d_unc = int((result["winner"] == "D_uncontested").sum())
+    n_r_unc = int((result["winner"] == "R_uncontested").sum())
 
-    print(f"\n  {year} House results — {n_total} districts:")
+    print(f"\n  {year} {office.display_name} results — {n_total} districts:")
     print(f"    Contested: {n_contested}  (D won: {n_d}, R won: {n_r})")
     print(f"    Uncontested: D={n_d_unc}, R={n_r_unc}")
     if n_contested > 0:
@@ -110,14 +140,13 @@ def parse_house_results(sos: SosFile) -> pd.DataFrame:
     return result
 
 
-def combine_house_results(results: list[pd.DataFrame]) -> pd.DataFrame:
-    """Combine results from multiple years into a wide format per district."""
+def combine_race_results(results: list[pd.DataFrame]) -> pd.DataFrame:
+    """Combine results from multiple years into wide format per district."""
     if not results:
         return pd.DataFrame()
 
     combined = pd.concat([r for r in results if not r.empty], ignore_index=True)
 
-    # Pivot to wide format: one row per district, columns per year
     metrics = ["dem_votes", "rep_votes", "dem_share", "margin", "winner", "contested"]
     frames = []
 
@@ -143,24 +172,27 @@ def combine_house_results(results: list[pd.DataFrame]) -> pd.DataFrame:
 # Candidate name extraction
 # ---------------------------------------------------------------------------
 
-def extract_candidate_names(sos: SosFile) -> pd.DataFrame:
+def extract_candidate_names(sos: SosFile, office: OfficeConfig) -> pd.DataFrame:
     """
-    Extract D and R candidate names for each district from a SosFile.
+    Extract D and R candidate names per district for ONE office.
 
     Returns DataFrame with columns:
       district, dem_candidate_{year}, rep_candidate_{year}
 
-    Candidate names come from the XLSX row-1 header (e.g. "Jane Doe (D)").
-    Only the first D and first R candidate per district are recorded;
-    primary runoffs with multiple candidates of the same party are rare in
-    Ohio general elections.
+    Names come from XLSX row-1 header (e.g. "Jane Doe (D)"). Only the first
+    D and R per district are recorded.
     """
+    if office.is_statewide:
+        raise NotImplementedError(
+            f"extract_candidate_names does not handle statewide office '{office.name}'."
+        )
+
     year = sos.year
-    house_map = sos.house
+    race_map: dict = getattr(sos, office.sos_race_attr)
 
     records = []
-    for dist_num in sorted(house_map.keys()):
-        spec = house_map[dist_num]
+    for dist_num in sorted(race_map.keys()):
+        spec = race_map[dist_num]
         dem_name = spec.d_candidate_names[0] if spec.d_candidate_names else None
         rep_name = spec.r_candidate_names[0] if spec.r_candidate_names else None
         records.append(
@@ -175,8 +207,14 @@ def extract_candidate_names(sos: SosFile) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Redistricting contamination filter
+# Redistricting contamination filter (house-specific for now)
 # ---------------------------------------------------------------------------
+#
+# These filters encode the *House* redistricting story (2018/2020 = old map,
+# 2022 = interim, 2024 = final). State Senate and Congressional offices each
+# have their own redistricting timeline and would need a parallel overlap
+# analysis. Until that exists, these filters are house-only and accept a
+# precomputed `overlap_df` keyed on house district numbers.
 
 _PRE_REDISTRICTING_YEARS = [2018, 2020]
 
@@ -200,12 +238,8 @@ def apply_redistricting_filter(
          the 2022 drop — a redrawn district retains partial precinct overlap and its
          2022 result is considered usable.
 
-    The second filter is applied only when 'overlap_category_interim_final' is
-    present in overlap_df (i.e., after running the updated redistricting check).
-
     Returns (filtered_house_long, summary_dict).
     """
-    # Filter 1: old→interim (2018/2020 for relocated/redrawn)
     contaminated_oi = overlap_df[
         overlap_df["overlap_category"].isin(["relocated", "redrawn"])
     ]["district"].tolist()
@@ -215,7 +249,6 @@ def apply_redistricting_filter(
         & house_long["year"].isin(_PRE_REDISTRICTING_YEARS)
     )
 
-    # Filter 2: interim→final (2022 for relocated only)
     contaminated_if: list[int] = []
     if "overlap_category_interim_final" in overlap_df.columns:
         contaminated_if = overlap_df[
@@ -262,11 +295,6 @@ def apply_redistricting_filter_to_composite(
 ) -> pd.DataFrame:
     """
     NaN out contaminated house result columns in the wide composite DataFrame.
-
-    Two passes mirroring apply_redistricting_filter:
-      1. 2018/2020 columns zeroed for old→interim relocated/redrawn districts.
-      2. 2022 columns zeroed for interim→final relocated districts (when
-         'overlap_category_interim_final' is present in overlap_df).
 
     Statewide race lean columns (e.g. gov_2018_lean) are NOT touched.
     """

@@ -20,10 +20,23 @@ from __future__ import annotations
 import pandas as pd
 
 from src.constants import LITERATURE_INCUMBENCY_ADVANTAGE  # reference only
+from src.office import HOUSE, OfficeConfig
 
-CURRENT_D_SEATS = 34
-MAJORITY = 50
-VETO_PROOF = 40
+# Default chamber rules — Ohio House. Module-level constants are retained for
+# back-compat with code that imports them directly. New callers should pass an
+# OfficeConfig to scenario functions and let those values override.
+CURRENT_D_SEATS = HOUSE.current_d_seats  # 34
+MAJORITY = HOUSE.majority_threshold      # 50
+VETO_PROOF = 40                          # OH House supermajority floor; not a generic concept
+
+
+def _chamber_rules(office: OfficeConfig | None) -> tuple[int, int]:
+    """Return (current_d_seats, majority) for the given office, defaulting to House."""
+    if office is None:
+        return CURRENT_D_SEATS, MAJORITY
+    cd = office.current_d_seats if office.current_d_seats is not None else CURRENT_D_SEATS
+    mj = office.majority_threshold if office.majority_threshold is not None else MAJORITY
+    return cd, mj
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +47,7 @@ def run_scenario_table(
     targeting_df: pd.DataFrame,
     d_range: tuple[float, float] = (0.40, 0.55),
     step: float = 0.005,
+    office: OfficeConfig | None = None,
 ) -> pd.DataFrame:
     """
     Run uniform swing scenarios over a range of statewide D shares.
@@ -51,6 +65,8 @@ def run_scenario_table(
     steps = round((d_range[1] - d_range[0]) / step) + 1
     statewide_values = [round(d_range[0] + i * step, 4) for i in range(steps)]
 
+    current_d_seats, _majority = _chamber_rules(office)
+
     rows = []
     prev_d_set: set[int] = set()
 
@@ -62,7 +78,7 @@ def run_scenario_table(
             {
                 "statewide_d_pct": round(sw_d * 100, 1),
                 "d_seats": len(d_districts),
-                "net_change_from_current": len(d_districts) - CURRENT_D_SEATS,
+                "net_change_from_current": len(d_districts) - current_d_seats,
                 "newly_flipped": ",".join(str(d) for d in newly_flipped),
                 "cumulative_d_districts": ",".join(
                     str(d) for d in sorted(d_districts)
@@ -135,27 +151,40 @@ def format_pickup_ladder(
     ladder_df: pd.DataFrame,
     scenario_df: pd.DataFrame,
     defensive_df: pd.DataFrame,
+    office: OfficeConfig | None = None,
 ) -> str:
     from src.classify import OPEN_SEATS_2026, REALISTIC_TARGET_THRESHOLD
 
+    current_d_seats, majority = _chamber_rules(office)
+    chamber_label = (office.display_name if office is not None else "Ohio House").upper()
+    veto_proof = VETO_PROOF if office is None or office.name == "house" else None
+
+    header_milestones = [
+        (current_d_seats, f"Hold {current_d_seats} seats (floor)"),
+        (majority, f"{majority} seats (majority)"),
+    ]
+    if veto_proof is not None:
+        header_milestones.insert(1, (veto_proof, f"{veto_proof} seats (veto-resistant)"))
+
+    summary_line = (
+        f"Current D seats: {current_d_seats}.  "
+        f"Majority: {majority} ({majority - current_d_seats} net flips)."
+    )
+    if veto_proof is not None:
+        summary_line += f"  Veto-resistant: {veto_proof} ({veto_proof - current_d_seats} net flips)."
+
     lines: list[str] = [
-        "OHIO HOUSE DEMOCRATIC PICKUP LADDER",
+        f"{chamber_label} DEMOCRATIC PICKUP LADDER",
         "=" * 75,
         "Uniform swing model. Flip@ = statewide D% at which composite lean tips D.",
         "Fundamentals only — no incumbency adjustment.",
-        f"Current D seats: {CURRENT_D_SEATS}.  "
-        f"Majority: {MAJORITY} ({MAJORITY - CURRENT_D_SEATS} net flips).  "
-        f"Veto-resistant: {VETO_PROOF} ({VETO_PROOF - CURRENT_D_SEATS} net flips).",
+        summary_line,
         "",
     ]
 
     # Key milestones
     lines.append("KEY STATEWIDE THRESHOLDS:")
-    for milestone, label in [
-        (CURRENT_D_SEATS, f"Hold {CURRENT_D_SEATS} seats (floor)"),
-        (VETO_PROOF, f"{VETO_PROOF} seats (veto-resistant)"),
-        (MAJORITY, f"{MAJORITY} seats (majority)"),
-    ]:
+    for milestone, label in header_milestones:
         match = scenario_df[scenario_df["d_seats"] >= milestone]
         if not match.empty:
             pct = match.iloc[0]["statewide_d_pct"]

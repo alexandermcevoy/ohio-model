@@ -1,6 +1,6 @@
 # Ohio House Election Model — Roadmap
 
-*Last updated: March 27, 2026*
+*Last updated: April 16, 2026*
 
 ---
 
@@ -63,11 +63,70 @@ Tiers changed from composite-lean-threshold-based to win-probability-based (Cook
 
 ---
 
-## Next: Data Acquisition + Extensions
+## In Progress: v3.0 — Public-Facing Four-Office Forecast
 
-### Data Acquisition
-- **County-level results 2000–2008** (free, Ohio SOS) — extends trend analysis to 25 years. The backbone already handles county-level disaggregation (proven with 2010–2014).
-- **VEST 2022/2024 shapefiles** (subscription required) — enables geometry-aware block disaggregation for post-redistricting cycles, replacing the current SOS→VEST 2020 precinct join.
+Strategic pivot from House-only conditional projection model to a published forecast covering Governor 2026, State House, State Senate, and US House. The conditional-projection layer (existing infrastructure) becomes the analytical depth backing a marginal forecast (new). Audience shifts from private analytical tool pitched to ODP leadership → public forecast that reporters cite.
+
+Four phases. Full plan at `~/.claude/plans/iterative-coalescing-candle.md`.
+
+### Phase A — Office expansion foundation (Session 14, ~80% complete)
+
+Generalize the existing pipeline from 99 House districts to four offices.
+
+- ✅ A.1 — Shapefiles acquired: `data/shapefiles/sldu_2026/` (Sept 2023 Senate plan), `data/shapefiles/cd_2026/` (NEW Oct 31, 2025 congressional plan).
+- ✅ A.2 — `src/office.py`: `OfficeConfig` dataclass + `OFFICES` registry. Single source of truth for n_districts, paths, chamber thresholds, SOS race attributes.
+- ✅ A.3 — SOS parser extended to extract `senate` and `congressional` race dicts.
+- ✅ A.4 — `src/ingest_house_results.py` → `src/ingest_race_results.py`, office-aware.
+- ✅ A.5 — Block-district maps for senate (`block_district_map_senate_2024.parquet`) and congress (`block_district_map_congress_2026.parquet`).
+- ✅ A.6 — Block votes for US House: `build_composite_from_blocks` extended.
+- ✅ A.7 — Hardcoded constants generalized: `scenarios.py`, `classify.py`, `backbone.py` all accept `OfficeConfig`.
+- ✅ A.8 — CLI restructure: typer subcommand groups (`house`, `senate`, `congress`, `governor`, `multi`); top-level commands auto-aliased into `house <cmd>` for back-compat.
+- ✅ A.9 — End-to-end pipeline: `<office> composite → classify → simulate` working for senate and congress.
+- ◐ A.10 — In progress.
+  - ✅ Per-office summary PDFs (`<office> report` CLI; outputs at `reports/session14/{prefix}_office_summary.pdf`). One summary PDF per office (lighter than 48 sparse per-district PDFs) per plan guidance.
+  - ⏳ External validation (DRA congressional CSV for US House analog of Session 5; senate has no DRA equivalent — needs alternative).
+  - ⏳ Backtest extension to senate/congress.
+  - ⏳ GUI multi-office support.
+  - ⏳ Governor "office" treatment (statewide degenerate case).
+
+**Sanity checks**:
+- Senate: SD-21 D+38 (Cleveland) safest D, SD-12 R+23 safest R. At 48% statewide D, mean 12.4 of 33 senate seats (current 9D); majority requires ~53%.
+- Congress (NEW Oct 2025 map): CD-11 D+33 safest D; CDs 1, 9, 10, 15 all near-tossups. At 48% statewide D, mean 5.1 of 15 (current 5D); P(+1) = 37%, P(+2) = 13%.
+
+### Phase B — Statewide environment forecast (governor first, MVP nowcast)
+
+Replace the user-supplied statewide D% slider with a probability distribution derived from polls + fundamentals. Pilot on governor (highest-profile, most polling, simplest single race).
+
+**Data refreshed 2026-09-11**:
+- `data/polls/governor.csv` — 5,332 rows nationwide; 22 unique Ohio 2026 governor general polls, 16 pollsters incl. NYT/Siena. Direct OH two-party D mean: 49.7%.
+- `data/polls/senate.csv` — new; 19 unique Ohio 2026 US Senate special polls (Brown vs. Husted), 13 pollsters incl. NYT/Siena. Direct OH two-party D mean: 50.5%.
+- `data/polls/approval_polls.csv` — new; poll-level national Trump approval (1,221 rows), supersedes `president-averages.csv` as the primary approval source.
+- `data/polls/generic_ballot.csv` — new; Silver Bulletin national generic-ballot polls (581 rows, Dec 2024–Sept 2026). **Closes the generic-ballot gap** flagged below — this is the primary national signal `national_to_state.py` now uses, not presidential approval (research on midterm forecasting models finds approval adds little once the generic ballot is known).
+
+**Built and verified 2026-09-11**: `src/ingest_polls.py` (shared 538-schema loading, two-party normalization, recency/quality-weighted averaging — reused across all three race-level poll files), `src/fundamentals.py` (national generic-ballot + approval aggregates), `src/national_to_state.py` (translates the national generic-ballot average to an Ohio-equivalent statewide D% via a small cited offset, `OHIO_VS_NATIONAL_OFFSET_MEAN` in `src/national_to_state.py`, built from Ohio's 2020/2024 presidential vote vs. certified national two-party vote — 2 data points, deliberately wide sigma). As of 2026-09-11: national generic ballot D+6.6, translated OH environment 47.7% D (±2.5 pts) — about 2-3 pts below the two direct OH polling averages, a plausible gap (candidate effects, offset noise) that `forecast_statewide.py` will need to reconcile, not evidence of a bug.
+
+**Built and verified 2026-09-11**: `simulate.py::run_simulations()` now accepts either a scalar `statewide_d` (unchanged) or a 1-D array of pre-drawn environment samples, producing an unconditional seat distribution (verified byte-identical scalar-mode output + no regressions in `run_probabilistic_scenario_table`/`compute_analytical_win_probs`/`build_investment_priority`/`run_defensive_scenarios`; distribution-mode smoke test with `national_to_state.build_environment_prior()`'s OH House samples: mean 39.4 seats, std 5.37 vs. 2.17 for the equivalent point simulation, P(≥40) 48.4% unconditional vs. 57.5% conditional on exactly 48%).
+
+**Built and verified 2026-09-11**: `src/forecast_statewide.py` blends the national fundamentals prior, direct OH governor polls, direct OH Senate polls, and `governor.py`'s historical 4-cycle baseline via inverse-variance weighting (governor/Senate poll sigmas inflated by a documented `CANDIDATE_IDIOSYNCRASY_SIGMA`; final sigma floored at `MIN_OHIO_SIGMA`=0.02 to guard against the naive combination's overconfidence from treating all signals as independent when Ohio-wide correlated polling error isn't modeled — that's Phase C's job). As of 2026-09-11: blended environment 50.1% D ± 2.0 pts (governor polls 35.5% weight, Senate polls 33.8%, national fundamentals 27.6%, historical baseline 3.1%). Feeds `simulate.py` distribution mode directly with no adapter: unconditional Ohio House forecast — mean 44.1 seats, 80% CI [38,50], P(≥40)=84.1%, P(majority)=12.7%.
+
+To do: wire this into `cli.py` (no command uses the Phase B chain yet — only the manual `--statewide-d` scalar workflow exists) and GUI. Forecast snapshot versioning to `forecasts/YYYY-MM-DD/{office}/`. Phase C's correlated multi-office posterior would also let `MIN_OHIO_SIGMA`'s blunt floor be replaced with an actual modeled correlated-error term.
+
+### Phase C — Multi-race correlation + heterogeneous swing
+
+Extend the forecast from one race to all four offices, with internally consistent (correlated) outcomes. Replace uniform-swing-plus-noise with a structured swing model.
+
+To do: `src/swing_decomposition.py` (PCA on residuals from uniform swing, 2 components max), `src/lean_drift.py` (forward-project composite lean to 2026 using `trend_slope`, demographic change, generational replacement). Joint multivariate posterior across (gov, USS-baseline, generic, statehouse-baseline).
+
+### Phase D — Public launch layer
+
+Brand, domain, polished public Streamlit deployment, methodology page, weekly cadence, post-election scorecard.
+
+---
+
+## Data Acquisition (ongoing)
+- **County-level results 2000–2008** (free, Ohio SOS) — extends trend analysis to 25 years. The backbone already handles county-level disaggregation.
+- **VEST 2022/2024 shapefiles** (subscription required) — enables geometry-aware block disaggregation for post-redistricting cycles.
+- ~~**Generic ballot time series**~~ — done 2026-09-11, `data/polls/generic_ballot.csv` (Silver Bulletin, 581 polls).
 
 ---
 
@@ -199,9 +258,15 @@ The tool is successful if:
 8. ☑ Session 11 — stakeholder GUI (Streamlit, deployed to Cloud)
 9. ☑ Session 12 — historical backtest (98% accuracy, Brier skill 0.878)
 10. ☑ Session 13 — tier terminology overhaul (WP-based tiers, Cook-style)
-11. ☐ Acquire county-level results 2000–2008
-11. ☐ Check VEST subscription pricing for 2022/2024 shapefiles
-12. ☐ Future sessions as priorities dictate
+11. ◐ Session 14 — Phase A multi-office expansion (composite/classify/simulate done for senate + congress; validation, PDFs, GUI extension pending)
+12. ◐ A.10 — Phase A finishing work: per-office summary PDFs ✅; external validation (DRA congressional), backtest extension, GUI multi-office support, governor degenerate case all still ⏳
+13. ◐ Phase B — governor MVP nowcast: full chain built and verified (2026-09-11) — `src/ingest_polls.py`, `src/fundamentals.py`, `src/national_to_state.py`, `src/forecast_statewide.py`, and `simulate.py`'s scalar→distribution change all done. Blended Ohio environment: 50.1% D ± 2.0 pts. Only `cli.py`/GUI wiring remains ⏳.
+14. ☐ Phase D partial — brand, domain, public launch with governor forecast + state house conditional surface
+15. ☐ Phase C — multivariate posterior, heterogeneous swing, lean drift, four-office joint forecast
+16. ☐ Phase D full — multi-office public launch, weekly cadence, post-election scorecard
+17. ☐ Acquire county-level results 2000–2008
+18. ☐ Check VEST subscription pricing for 2022/2024 shapefiles
+19. ☑ Acquire/curate generic ballot time series for Phase B `national_to_state.py` — `data/polls/generic_ballot.csv` (Silver Bulletin, 581 polls, Dec 2024–Sept 2026)
 
 ---
 

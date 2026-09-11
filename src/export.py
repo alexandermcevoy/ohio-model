@@ -1659,3 +1659,330 @@ def _parse_md_table(lines: list[str]):
     ]))
     tbl.hAlign = "LEFT"
     return tbl
+
+
+# ---------------------------------------------------------------------------
+# Multi-office summary PDF (Session 14 / Phase A.10)
+# ---------------------------------------------------------------------------
+
+def generate_office_summary(
+    office: Any,                           # OfficeConfig (typed loosely to avoid import cycle)
+    targeting_df: pd.DataFrame,
+    composite_df: pd.DataFrame,
+    scenario_df: pd.DataFrame | None = None,
+    prob_scenario_df: pd.DataFrame | None = None,
+    win_prob_df: pd.DataFrame | None = None,
+    investment_df: pd.DataFrame | None = None,
+    output_path: str | Path | None = None,
+) -> Path:
+    """
+    Generate a single per-office summary PDF (senate / congress / house).
+
+    Unlike the per-district house profiles, this is one document per office:
+      - Header banner (office name, current split, date)
+      - Probabilistic seat outlook at 46 / 48 / 50% statewide D
+      - Tier distribution at the three reference environments
+      - Pickup ladder (top R-held by investment rank, fallback to lean)
+      - Defensive priorities (D-held at risk)
+      - Per-district table: lean, tier, win prob at 48%, holder, investment rank
+
+    Parameters
+    ----------
+    office : OfficeConfig
+        Used for display_name, output_prefix, current_d_seats, chamber_size,
+        majority_threshold. Paths derive from office.output_prefix.
+    """
+    from datetime import date
+
+    prefix = office.output_prefix
+    if output_path is None:
+        output_path = Path("reports/session14") / f"{prefix}_office_summary.pdf"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Palette / styles ─────────────────────────────────────────────────────
+    OHIO_BLUE   = colors.HexColor("#003478")
+    ACCENT      = colors.HexColor("#1565C0")
+    LIGHT_BLUE  = colors.HexColor("#E3EDF7")
+    MID_GRAY    = colors.HexColor("#555555")
+    LIGHT_GRAY  = colors.HexColor("#F5F5F5")
+    WHITE       = colors.white
+    BLACK       = colors.black
+
+    def ps(name, **kw):
+        return ParagraphStyle(name, **kw)
+
+    S = {
+        "title":    ps("t",  fontName="Helvetica-Bold", fontSize=17, leading=20, textColor=WHITE),
+        "subtitle": ps("st", fontName="Helvetica",      fontSize=9.5, leading=12, textColor=colors.HexColor("#B0C8E8")),
+        "section":  ps("sc", fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=OHIO_BLUE, spaceBefore=7, spaceAfter=3),
+        "body":     ps("b",  fontName="Helvetica",      fontSize=8.5, leading=11, textColor=BLACK),
+        "caption":  ps("c",  fontName="Helvetica-Oblique", fontSize=7.5, leading=9.5, textColor=MID_GRAY),
+        "footer":   ps("f",  fontName="Helvetica",      fontSize=7, leading=9, textColor=MID_GRAY, alignment=TA_CENTER),
+    }
+
+    flow: list[Any] = []
+
+    # ── Header banner ────────────────────────────────────────────────────────
+    today = date.today().isoformat()
+    curD = office.current_d_seats if office.current_d_seats is not None else "?"
+    size = office.chamber_size if office.chamber_size is not None else "?"
+    try:
+        curR = int(size) - int(curD) if isinstance(curD, int) else "?"
+    except Exception:
+        curR = "?"
+
+    subtitle_bits = [f"Current split: {curR}R – {curD}D"]
+    if office.majority_threshold is not None:
+        subtitle_bits.append(f"Majority = {office.majority_threshold}")
+    subtitle_bits.append(f"Generated {today}")
+    subtitle = "   •   ".join(subtitle_bits)
+
+    banner_tbl = Table(
+        [[Paragraph(f"{office.display_name} — 2026 Forecast Summary", S["title"])],
+         [Paragraph(subtitle, S["subtitle"])]],
+        colWidths=[PAGE_W - 2 * MARGIN],
+    )
+    banner_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), OHIO_BLUE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    flow.append(banner_tbl)
+    flow.append(Spacer(1, 7))
+
+    # ── Probabilistic seat outlook ───────────────────────────────────────────
+    flow.append(Paragraph("PROBABILISTIC SEAT OUTLOOK", S["section"]))
+    if prob_scenario_df is not None and not prob_scenario_df.empty:
+        ref_envs = [46.0, 48.0, 50.0]
+        header = ["Statewide D%", "Mean seats", "P10–P90 range", "Median"]
+        hold_col = f"prob_hold_{curD}" if isinstance(curD, int) else None
+        has_hold = hold_col and hold_col in prob_scenario_df.columns
+        if has_hold:
+            header.append(f"P(hold ≥{curD})")
+        maj_col = "prob_majority"
+        has_maj = maj_col in prob_scenario_df.columns and office.majority_threshold is not None
+        if has_maj:
+            header.append(f"P(≥{office.majority_threshold})")
+
+        rows = [header]
+        for env in ref_envs:
+            match = prob_scenario_df[prob_scenario_df["statewide_d_pct"] == env]
+            if match.empty:
+                continue
+            r = match.iloc[0]
+            row = [
+                f"{env:.1f}%",
+                f"{r['mean_d_seats']:.1f}",
+                f"{int(r['p10_seats'])} – {int(r['p90_seats'])}",
+                f"{int(r['median_d_seats'])}",
+            ]
+            if has_hold:
+                row.append(f"{r[hold_col]*100:.0f}%")
+            if has_maj:
+                row.append(f"{r[maj_col]*100:.0f}%")
+            rows.append(row)
+
+        col_w = (PAGE_W - 2 * MARGIN) / len(header)
+        tbl = Table(rows, colWidths=[col_w] * len(header))
+        tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#BBBBBB")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        flow.append(tbl)
+    else:
+        flow.append(Paragraph("Probabilistic scenario data unavailable.", S["caption"]))
+
+    # ── Tier distribution ────────────────────────────────────────────────────
+    flow.append(Paragraph("TIER DISTRIBUTION BY STATEWIDE ENVIRONMENT", S["section"]))
+    tier_order = ["safe_d", "likely_d", "lean_d", "tossup", "lean_r", "likely_r", "safe_r"]
+    tier_header = ["Environment"] + [TIER_LABELS[t] for t in tier_order]
+    tier_rows = [tier_header]
+    for env, col in [(46, "tier_46"), (48, "tier_48"), (50, "tier_50")]:
+        if col not in targeting_df.columns:
+            continue
+        counts = targeting_df[col].value_counts()
+        tier_rows.append([f"{env}% D"] + [str(int(counts.get(t, 0))) for t in tier_order])
+    col_w = [0.9 * inch] + [(PAGE_W - 2 * MARGIN - 0.9 * inch) / len(tier_order)] * len(tier_order)
+    tier_tbl = Table(tier_rows, colWidths=col_w)
+    tier_tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#BBBBBB")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]))
+    flow.append(tier_tbl)
+
+    # ── Pickup ladder ────────────────────────────────────────────────────────
+    flow.append(Paragraph("TOP PICKUP OPPORTUNITIES (R-held)", S["section"]))
+    r_held = targeting_df[targeting_df.get("current_holder", "") == "R"].copy()
+    if investment_df is not None and "district" in investment_df.columns:
+        r_held = r_held.merge(
+            investment_df[["district", "investment_rank", "win_prob", "marginal_wp"]],
+            on="district", how="left",
+        )
+        r_held = r_held.sort_values("investment_rank", na_position="last")
+    else:
+        r_held = r_held.sort_values("composite_lean", ascending=False)
+
+    top_n = min(10, len(r_held))
+    pickup_header = ["Rank", "District", "Lean", "Tier @48%", "WP @48%", "Flip thresh.", "Open 2026"]
+    pickup_rows = [pickup_header]
+    for i, r in r_held.head(top_n).reset_index(drop=True).iterrows():
+        wp48 = r.get("wp_48", r.get("win_prob", None))
+        pickup_rows.append([
+            str(i + 1),
+            str(int(r["district"])),
+            _fmt_lean_cook(r.get("composite_lean")),
+            TIER_LABELS.get(r.get("tier_48", r.get("tier", "")), "—"),
+            f"{wp48*100:.0f}%" if pd.notna(wp48) else "—",
+            _fmt_pct(r.get("flip_threshold")),
+            "✓" if bool(r.get("open_seat_2026", False)) else "",
+        ])
+    pickup_tbl = Table(pickup_rows, colWidths=[0.5*inch, 0.7*inch, 0.7*inch, 1.0*inch, 0.8*inch, 0.9*inch, 0.7*inch])
+    pickup_tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#BBBBBB")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]))
+    flow.append(pickup_tbl)
+
+    # ── Defensive priorities ─────────────────────────────────────────────────
+    flow.append(Paragraph("DEFENSIVE PRIORITIES (D-held at risk)", S["section"]))
+    d_held = targeting_df[targeting_df.get("current_holder", "") == "D"].copy()
+    # At risk = tier_48 in {tossup, lean_r, likely_r, lean_d} (the competitive D-held)
+    risk_tiers = {"tossup", "lean_r", "likely_r", "lean_d"}
+    at_risk = d_held[d_held.get("tier_48", "").isin(risk_tiers)].copy()
+    if at_risk.empty:
+        flow.append(Paragraph("No D-held seats currently flagged as at-risk.", S["caption"]))
+    else:
+        at_risk = at_risk.sort_values("composite_lean")
+        def_header = ["District", "Lean", "Tier @48%", "WP @48%", "WP @46%"]
+        def_rows = [def_header]
+        for _, r in at_risk.iterrows():
+            wp48 = r.get("wp_48", np.nan)
+            wp46 = r.get("wp_46", np.nan)
+            def_rows.append([
+                str(int(r["district"])),
+                _fmt_lean_cook(r.get("composite_lean")),
+                TIER_LABELS.get(r.get("tier_48", ""), "—"),
+                f"{wp48*100:.0f}%" if pd.notna(wp48) else "—",
+                f"{wp46*100:.0f}%" if pd.notna(wp46) else "—",
+            ])
+        def_tbl = Table(def_rows, colWidths=[0.9*inch, 0.9*inch, 1.1*inch, 0.9*inch, 0.9*inch])
+        def_tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#BBBBBB")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ]))
+        flow.append(def_tbl)
+
+    # ── Full district table ──────────────────────────────────────────────────
+    flow.append(Paragraph("ALL DISTRICTS — LEAN, TIER, WIN PROBABILITY", S["section"]))
+    districts = targeting_df.sort_values("district").copy()
+    # Note if senate, flag districts on 2026 ballot
+    seats_up_set = set(getattr(office, "seats_up_2026", ()) or ())
+    all_up = len(seats_up_set) >= (office.n_districts or 0)
+    full_header = ["Dist.", "Lean", "Tier @48%", "WP @48%", "Holder"]
+    if not all_up and seats_up_set:
+        full_header.append("2026?")
+    full_rows = [full_header]
+    for _, r in districts.iterrows():
+        wp48 = r.get("wp_48", np.nan)
+        row = [
+            str(int(r["district"])),
+            _fmt_lean_cook(r.get("composite_lean")),
+            TIER_LABELS.get(r.get("tier_48", ""), "—"),
+            f"{wp48*100:.0f}%" if pd.notna(wp48) else "—",
+            str(r.get("current_holder", "—")),
+        ]
+        if not all_up and seats_up_set:
+            row.append("✓" if int(r["district"]) in seats_up_set else "")
+        full_rows.append(row)
+
+    # Split into 2 or 3 columns if the table is long
+    n_cols_in_row = 2 if len(districts) > 20 else 1
+    if n_cols_in_row == 1:
+        cw = [(PAGE_W - 2 * MARGIN) / len(full_header)] * len(full_header)
+        tbl = Table(full_rows, colWidths=cw, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        flow.append(tbl)
+    else:
+        # Two-column layout: split body rows in half
+        body = full_rows[1:]
+        half = (len(body) + 1) // 2
+        left_rows = [full_header] + body[:half]
+        right_rows = [full_header] + body[half:]
+        # Pad right to same length if uneven
+        while len(right_rows) < len(left_rows):
+            right_rows.append([""] * len(full_header))
+
+        sub_col_w = [(PAGE_W - 2 * MARGIN - 0.15 * inch) / 2 / len(full_header)] * len(full_header)
+        def mk(tbl_rows):
+            t = Table(tbl_rows, colWidths=sub_col_w, repeatRows=1)
+            t.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+            ]))
+            return t
+        outer = Table([[mk(left_rows), mk(right_rows)]],
+                      colWidths=[(PAGE_W - 2 * MARGIN) / 2] * 2)
+        outer.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        flow.append(outer)
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    flow.append(Spacer(1, 6))
+    flow.append(HRFlowable(width="100%", thickness=0.3, color=MID_GRAY))
+    footer_text = (
+        f"Ohio Election Model {VERSION}   •   {office.display_name}   •   "
+        f"Methodology: {METHODOLOGY_REF}   •   Composite lean computed from block backbone "
+        f"(2010–2024 cycles where available)."
+    )
+    flow.append(Paragraph(footer_text, S["footer"]))
+
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=LETTER,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+        topMargin=MARGIN,
+        bottomMargin=MARGIN,
+    )
+    doc.build(flow)
+    return output_path

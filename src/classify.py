@@ -11,11 +11,17 @@ Districts with fewer than 2 contested races are flagged (n_contested < 2).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
 from src.constants import LITERATURE_INCUMBENCY_ADVANTAGE  # kept for reference; not wired to calculations
+from src.office import HOUSE, OfficeConfig
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PROCESSED = REPO_ROOT / "data" / "processed"
 
 # ---------------------------------------------------------------------------
 # Win-probability tier thresholds (Cook-style)
@@ -63,6 +69,35 @@ OPEN_SEATS_2026: dict[int, dict[str, str]] = {
 # Source: Wikipedia "2026 Ohio House of Representatives election" + Ballotpedia
 # Last verified: March 2026
 # UPDATE THIS as new retirements/filing-deadline announcements arrive.
+#
+# This in-memory dict is the seed for the Ohio House and remains the canonical
+# source for that office (mirrored to data/processed/open_seats_2026_house.csv).
+# For senate / congress, populate per-office CSVs at the same path:
+#   data/processed/open_seats_2026_{office.name}.csv  (columns: district, incumbent, reason)
+# load_open_seats(office) below handles dispatch.
+
+
+def load_open_seats(office: OfficeConfig | None = None) -> dict[int, dict[str, str]]:
+    """
+    Load 2026 open-seat intelligence for the given office.
+
+    For Ohio House, returns the in-memory OPEN_SEATS_2026 seed (preserves the
+    no-CSV-required path that has been the convention throughout development).
+    For other offices, reads data/processed/open_seats_2026_{office.name}.csv.
+    Returns an empty dict if no CSV exists yet (multi-office work in progress).
+    """
+    if office is None or office.name == "house":
+        return OPEN_SEATS_2026
+
+    csv_path = PROCESSED / f"open_seats_2026_{office.name}.csv"
+    if not csv_path.exists():
+        return {}
+
+    df = pd.read_csv(csv_path)
+    return {
+        int(row["district"]): {"incumbent": str(row["incumbent"]), "reason": str(row["reason"])}
+        for _, row in df.iterrows()
+    }
 
 
 def assign_tier_from_wp(win_prob: float) -> str:
@@ -178,7 +213,29 @@ def classify_districts(
             return "R"
         return "unknown"
 
-    df["current_holder"] = df["winner_2024"].apply(_holder) if "winner_2024" in df.columns else "unknown"
+    # Walk most-recent-first across available winner columns. Important for
+    # State Senate staggered terms: odd-numbered districts last had elections
+    # in 2022, even-numbered in 2024, so winner_2024 alone leaves half the
+    # chamber as "unknown".
+    winner_cols = [
+        c for c in ("winner_2024", "winner_2022", "winner_2020", "winner_2018")
+        if c in df.columns
+    ]
+    if winner_cols:
+        holder = pd.Series("unknown", index=df.index, dtype=object)
+        winner_year = pd.Series(pd.NA, index=df.index, dtype="Int64")
+        for col in winner_cols:
+            year = int(col.split("_")[1])
+            mask_unknown = holder == "unknown"
+            new_holder = df[col].apply(_holder)
+            fill_mask = mask_unknown & (new_holder != "unknown")
+            holder = holder.where(~fill_mask, new_holder)
+            winner_year = winner_year.where(~fill_mask, year)
+        df["current_holder"] = holder
+        df["current_holder_source_year"] = winner_year
+    else:
+        df["current_holder"] = "unknown"
+        df["current_holder_source_year"] = pd.NA
 
     _tier_favors: dict[str, str | None] = {
         "safe_d": "D", "likely_d": "D", "lean_d": "D",
@@ -320,6 +377,7 @@ def build_targeting_df(
     house_long: pd.DataFrame,
     candidate_names_2024: pd.DataFrame | None = None,
     sigma_df: pd.DataFrame | None = None,
+    office: OfficeConfig | None = None,
 ) -> pd.DataFrame:
     """
     Full targeting DataFrame: classify + swing metrics + flip threshold +
@@ -331,7 +389,7 @@ def build_targeting_df(
     house_long   : long-format house results
     candidate_names_2024 : optional DataFrame with columns
         [district, dem_candidate_2024, rep_candidate_2024] from
-        extract_candidate_names(sos_2024). When provided, populates
+        extract_candidate_names(sos_2024, HOUSE). When provided, populates
         current_incumbent_name for non-open-seat districts.
     sigma_df : optional DataFrame with columns [district, sigma_i] from
         estimate_district_sigma(). When provided, tiers are based on
@@ -352,16 +410,45 @@ def build_targeting_df(
         (df["current_holder"] == "R") & (df["flip_threshold"] <= REALISTIC_TARGET_THRESHOLD)
     )
 
+    # ── Race-result reliability under current map ────────────────────────────
+    # The composite lean is built on the *current* map via block reaggregation,
+    # so it's clean. But race-result columns (dem_share_{year}, winner_{year},
+    # margin_{year}, contested_{year}) are joined by district *number* and
+    # therefore valid only for years when the same map+numbering was in effect.
+    #
+    # Conservative defaults per office:
+    #   house    — defer to existing redistricting_overlap.csv (years_reliable
+    #              column is added by apply_redistricting_filter / merge upstream).
+    #              Only set here if missing entirely.
+    #   senate   — current map (Sept 2023) used 2024+; odd-numbered districts
+    #              last had elections in 2022 under interim/old maps, so 2022
+    #              numbering does NOT match 2026 numbering. 2024 reliable for
+    #              even districts only.
+    #   congress — Oct 31, 2025 plan is BRAND NEW; no prior CD-numbered
+    #              results align with 2026 numbering. years_reliable is empty
+    #              for every CD.
+    if office is not None and office.name == "senate":
+        df["years_reliable_for_race_history"] = df["district"].apply(
+            lambda d: "2024" if d % 2 == 0 else ""
+        )
+    elif office is not None and office.name == "congress":
+        df["years_reliable_for_race_history"] = ""
+    elif "years_reliable_for_race_history" not in df.columns and "years_reliable" not in df.columns:
+        # House default — pre-existing redistricting_overlap merge usually fills
+        # `years_reliable`; leave that alone if already present.
+        df["years_reliable_for_race_history"] = "2024"
+
     # ── 2026 open seat intelligence ──────────────────────────────────────────
-    df["open_seat_2026"] = df["district"].isin(OPEN_SEATS_2026)
+    open_seats = load_open_seats(office)
+    df["open_seat_2026"] = df["district"].isin(open_seats)
     df["open_seat_reason"] = df["district"].map(
-        {k: v["reason"] for k, v in OPEN_SEATS_2026.items()}
+        {k: v["reason"] for k, v in open_seats.items()}
     )
 
-    # Incumbent name: start from OPEN_SEATS_2026 (known retirements/TL),
+    # Incumbent name: start from open-seat data (known retirements/TL),
     # then fill remaining seats from 2024 candidate data if provided.
     df["current_incumbent_name"] = df["district"].map(
-        {k: v["incumbent"] for k, v in OPEN_SEATS_2026.items()}
+        {k: v["incumbent"] for k, v in open_seats.items()}
     )
     if candidate_names_2024 is not None:
         cand = candidate_names_2024[
@@ -410,8 +497,9 @@ def build_targeting_df(
     base_cols = [
         "district", "composite_lean", "tier",
     ] + env_cols + [
-        "current_holder", "holder_matches_tier",
+        "current_holder", "current_holder_source_year", "holder_matches_tier",
         "pickup_opportunity", "defensive_priority",
+        "years_reliable_for_race_history",
         "contested_2024", "margin_2024", "candidate_effect_2024",
         "swing_sd", "n_contested", "turnout_elasticity", "target_mode",
         "flip_threshold", "realistic_target",

@@ -85,7 +85,9 @@ def build_composite(
     district_leans : {(year, race_label): Series indexed by district_num}
         Lean values (district D-share minus statewide D-share) for each race.
     weights : Weight dict; defaults to DEFAULT_WEIGHTS.
-    all_districts : Expected district numbers 1-99; defaults to range(1, 100).
+    all_districts : Expected district numbers. REQUIRED for non-house offices.
+        For backward compatibility, defaults to Ohio House (1..99) when omitted.
+        Pass `office.district_range` for senate, congress, etc.
 
     Returns
     -------
@@ -95,7 +97,7 @@ def build_composite(
     if weights is None:
         weights = DEFAULT_WEIGHTS
     if all_districts is None:
-        all_districts = list(range(1, 100))
+        all_districts = list(range(1, 100))  # default = Ohio House
 
     # Inject statewide_avg as a virtual race
     augmented = dict(district_leans)

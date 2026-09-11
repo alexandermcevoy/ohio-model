@@ -89,3 +89,42 @@ Size of the hypothetical lean improvement per investment unit (1 percentage poin
 Used in the path-to-target optimizer: each 'investment' shifts a district's
 effective lean by this amount. Abstract — not tied to a specific dollar amount.
 """
+
+# ---------------------------------------------------------------------------
+# Poll weighting (Phase B — src/ingest_polls.py, src/fundamentals.py)
+# ---------------------------------------------------------------------------
+
+POLL_RECENCY_HALF_LIFE_DAYS: float = 21.0
+"""
+Exponential recency decay half-life for poll weighting. A poll's weight
+halves every this many days from `as_of`.
+
+NOT empirically calibrated — no historical (pre-2025) polling archive exists
+in this repo to backtest half-life choices against, so this is a judgment
+call: for a nowcast ~2 months from a November election, recent polls should
+dominate heavily (roughly matching how public aggregators like Silver
+Bulletin/538 weight late-cycle polling). At 21 days, a poll from 6 months
+ago carries ~0.3% of a same-day poll's weight — i.e. the reported average is
+effectively a ~6-week rolling average, not a full-cycle mean.
+
+Revisit once a real backtest is possible (see CLAUDE.md Known Limitations —
+no pre-2025 generic-ballot/approval series exists yet).
+"""
+
+POLL_PARTISAN_DISCOUNT: float = 0.5
+"""
+Weight multiplier applied to polls flagged `partisan` (sponsored by a party/
+campaign committee) or `internal` (campaign-commissioned). Downweighted, not
+excluded — they still carry information but skew predictably toward their
+sponsor. 0.5 is a round-number judgment call, not a fit value.
+"""
+
+POLL_MISSING_GRADE_DEFAULT: float = 1.5
+"""
+Fallback numeric_grade (roughly 0-3 scale in the 538-schema feed) applied
+when a pollster has no rating on file — common for newer 2026-cycle
+pollsters. As of the Sept 2026 acquisition, `numeric_grade` is null for
+EVERY Ohio governor/Senate poll in the dataset, so this default currently
+governs all of them; the partisan/internal discount above is the only
+quality signal actually differentiating polls right now.
+"""

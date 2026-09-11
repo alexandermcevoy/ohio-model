@@ -42,6 +42,15 @@ PREC_NAME_COL = "precinct_name"
 META_COLS = 8   # columns before vote data begins
 
 _HOUSE_RE = re.compile(r"State Representative.*?District\s+(\d+)", re.IGNORECASE)
+_SENATE_RE = re.compile(r"State Senator.*?District\s+(\d+)", re.IGNORECASE)
+_CONGRESS_RE = re.compile(r"Representative to Congress.*?District\s+(\d+)", re.IGNORECASE)
+
+# Mode -> regex for district-keyed offices. 'statewide' is special-cased.
+_DISTRICT_MODE_REGEX: dict[str, re.Pattern] = {
+    "house": _HOUSE_RE,
+    "senate": _SENATE_RE,
+    "congressional": _CONGRESS_RE,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +74,14 @@ class RaceSpec:
 class SosFile:
     year: str
     path: Path
-    statewide: dict[str, RaceSpec]    # label -> RaceSpec
-    house: dict[int, RaceSpec]        # district_num -> RaceSpec
-    precinct_statewide: pd.DataFrame  # county_name, precinct_code, [vote cols]
-    precinct_house: pd.DataFrame      # county_name, precinct_code, [house vote cols]
+    statewide: dict[str, RaceSpec]         # label -> RaceSpec
+    house: dict[int, RaceSpec]             # district_num -> RaceSpec
+    senate: dict[int, RaceSpec]            # district_num -> RaceSpec (only districts up that cycle)
+    congressional: dict[int, RaceSpec]     # district_num -> RaceSpec
+    precinct_statewide: pd.DataFrame       # county_name, precinct_code, [vote cols]
+    precinct_house: pd.DataFrame           # county_name, precinct_code, [house vote cols]
+    precinct_senate: pd.DataFrame          # county_name, precinct_code, [senate vote cols]
+    precinct_congressional: pd.DataFrame   # county_name, precinct_code, [cd vote cols]
 
 
 # ---------------------------------------------------------------------------
@@ -90,13 +103,13 @@ def _parse_sheet(ws, mode: str) -> tuple[dict, pd.DataFrame]:
     Parameters
     ----------
     ws : openpyxl worksheet (read-only)
-    mode : 'statewide' or 'house'
+    mode : 'statewide' | 'house' | 'senate' | 'congressional'
 
     Returns
     -------
     race_map : dict
-        For 'statewide': {label: RaceSpec}
-        For 'house':     {district_num: RaceSpec}
+        For 'statewide':                       {label: RaceSpec}
+        For 'house'/'senate'/'congressional':  {district_num: RaceSpec}
     df : DataFrame
         Precinct rows with columns [county_name, precinct_code, precinct_name,
         <vote_col_1>, <vote_col_2>, ...]
@@ -140,11 +153,13 @@ def _parse_sheet(ws, mode: str) -> tuple[dict, pd.DataFrame]:
             if label is None:
                 continue
             key = label
-        else:  # house
-            m = _HOUSE_RE.search(race_raw)
+        elif mode in _DISTRICT_MODE_REGEX:
+            m = _DISTRICT_MODE_REGEX[mode].search(race_raw)
             if not m:
                 continue
             key = int(m.group(1))
+        else:
+            raise ValueError(f"Unknown _parse_sheet mode: {mode!r}")
 
         race_cols.setdefault(key, {"d": [], "r": [], "d_cand": [], "r_cand": []})
         party_key = "d" if party == "D" else "r"
@@ -156,25 +171,31 @@ def _parse_sheet(ws, mode: str) -> tuple[dict, pd.DataFrame]:
     vote_names: list[str] = []
     race_map: dict = {}
 
+    is_district_mode = mode in _DISTRICT_MODE_REGEX
+
     for key, dr in race_cols.items():
-        label = str(key) if mode == "house" else key
+        label = str(key) if is_district_mode else key
+        # Prefix district-keyed column names with the office mode to avoid
+        # collisions when the same district number appears in different modes
+        # (e.g. House district 1 vs Senate district 1 vs CD 1).
+        col_prefix = f"{mode}_{label}" if is_district_mode else label
         d_names, r_names = [], []
 
         for j, idx in enumerate(dr["d"]):
-            nm = f"{key}_d{j}" if mode == "house" else f"{label}_d{j}"
+            nm = f"{col_prefix}_d{j}"
             vote_indices.append(idx)
             vote_names.append(nm)
             d_names.append(nm)
 
         for j, idx in enumerate(dr["r"]):
-            nm = f"{key}_r{j}" if mode == "house" else f"{label}_r{j}"
+            nm = f"{col_prefix}_r{j}"
             vote_indices.append(idx)
             vote_names.append(nm)
             r_names.append(nm)
 
         office_raw = col_race[dr["d"][0] if dr["d"] else dr["r"][0]]
         race_map[key] = RaceSpec(
-            label=str(key) if mode == "house" else label,
+            label=label,
             office=office_raw or "",
             d_cols=d_names,
             r_cols=r_names,
@@ -262,10 +283,11 @@ def load_sos_file(path: str | Path) -> SosFile:
         sw_race_map.update(rm)
         sw_dfs.append(df)
 
-    # U.S. Congress sheet — extract Senate only
-    ws = _find_sheet(wb, "u.s. congress")
-    if ws:
-        rm, df = _parse_sheet(ws, "statewide")
+    # U.S. Congress sheet — extract U.S. Senator (statewide) here;
+    # CD races are re-parsed below in district-mode.
+    ws_uscong = _find_sheet(wb, "u.s. congress")
+    if ws_uscong:
+        rm, df = _parse_sheet(ws_uscong, "statewide")
         if "uss" in rm:
             uss_spec = rm["uss"]
             sw_race_map["uss"] = uss_spec
@@ -285,17 +307,27 @@ def load_sos_file(path: str | Path) -> SosFile:
     else:
         precinct_sw = pd.DataFrame(columns=id_cols)
 
-    # ── House races ──────────────────────────────────────────────────────────
-    ws = _find_sheet(wb, "general assembly", "gen assembly", "ohio general assembly")
-    if ws:
-        house_map, precinct_house = _parse_sheet(ws, "house")
+    # ── House + Senate races (both live in General Assembly sheet) ──────────
+    ws_genassy = _find_sheet(wb, "general assembly", "gen assembly", "ohio general assembly")
+    if ws_genassy:
+        house_map, precinct_house = _parse_sheet(ws_genassy, "house")
+        senate_map, precinct_senate = _parse_sheet(ws_genassy, "senate")
     else:
         house_map, precinct_house = {}, pd.DataFrame(columns=id_cols)
+        senate_map, precinct_senate = {}, pd.DataFrame(columns=id_cols)
+
+    # ── Congressional (US House) races (re-parse U.S. Congress sheet) ───────
+    if ws_uscong:
+        cong_map, precinct_cong = _parse_sheet(ws_uscong, "congressional")
+    else:
+        cong_map, precinct_cong = {}, pd.DataFrame(columns=id_cols)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     contested = [k for k, v in sw_race_map.items() if v.has_contest()]
     print(f"  Statewide contested races found: {sorted(contested)}")
-    print(f"  House districts parsed: {len(house_map)}")
+    print(f"  House districts parsed:         {len(house_map)}")
+    print(f"  Senate districts parsed:        {len(senate_map)}")
+    print(f"  Congressional districts parsed: {len(cong_map)}")
     _print_totals(precinct_sw, sw_race_map)
 
     return SosFile(
@@ -303,8 +335,12 @@ def load_sos_file(path: str | Path) -> SosFile:
         path=path,
         statewide=sw_race_map,
         house=house_map,
+        senate=senate_map,
+        congressional=cong_map,
         precinct_statewide=precinct_sw,
         precinct_house=precinct_house,
+        precinct_senate=precinct_senate,
+        precinct_congressional=precinct_cong,
     )
 
 

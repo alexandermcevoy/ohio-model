@@ -232,15 +232,22 @@ def build_block_precinct_map(
 
 def build_block_district_map(
     district_gdf: gpd.GeoDataFrame,
-    plan: str = "2024",
+    plan: str = "house_2024",
     blocks: pd.DataFrame | None = None,
     force: bool = False,
+    expected_n: int | None = None,
 ) -> pd.DataFrame:
     """
     Centroid-assign blocks to districts.
 
     Returns DataFrame with columns: block_geoid, district_num
-    One map per district plan (currently only 2024 final map).
+    One map per district plan.
+
+    Parameters
+    ----------
+    expected_n : optional district-count check (e.g. 99 for House, 33 for Senate,
+        15 for Congress). Pass `office.n_districts`. Defaults to 99 (Ohio House)
+        for backward compatibility.
     """
     out_path = _block_district_map_path(plan)
     if out_path.exists() and not force:
@@ -277,14 +284,48 @@ def build_block_district_map(
     result = assigned[["block_geoid", "district_num"]].copy()
 
     # Validate
+    if expected_n is None:
+        expected_n = 99  # default = Ohio House
     n_districts = result["district_num"].nunique()
     print(f"  Assigned {len(result):,} blocks to {n_districts} districts")
-    if n_districts != 99:
-        print(f"  WARNING: Expected 99 districts, got {n_districts}")
+    if n_districts != expected_n:
+        print(f"  WARNING: Expected {expected_n} districts, got {n_districts}")
 
     result.to_parquet(out_path, index=False)
     print(f"  Saved to {out_path}")
     return result
+
+
+def build_block_district_map_for_office(
+    office,
+    blocks: pd.DataFrame | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """
+    Build a block→district map for a given OfficeConfig.
+
+    Wraps build_block_district_map() with the office's shapefile path,
+    district-number column, and parquet plan label. Returns the same
+    DataFrame (block_geoid, district_num) and writes to
+    data/processed/block_district_map_{office.map_plan_label}.parquet.
+
+    Skips offices with no shapefile (e.g. governor — statewide).
+    """
+    from src.ingest import load_districts  # local import to avoid cycles
+
+    if office.shapefile_path is None:
+        print(f"  Office '{office.name}' is statewide; no block-district map needed.")
+        return pd.DataFrame(columns=["block_geoid", "district_num"])
+
+    print(f"\n--- Building block-district map for {office.display_name} ({office.map_plan_label}) ---")
+    districts = load_districts(office.shapefile_path, expected_n=office.n_districts)
+    return build_block_district_map(
+        districts,
+        plan=office.map_plan_label,
+        blocks=blocks,
+        force=force,
+        expected_n=office.n_districts,
+    )
 
 
 # =========================================================================
@@ -812,6 +853,7 @@ def build_composite_from_blocks(
     years: list[str],
     block_district_map: pd.DataFrame,
     weights: dict[tuple[str, str], float] | None = None,
+    all_districts: list[int] | None = None,
 ) -> pd.DataFrame:
     """
     End-to-end: load block vote surfaces → district leans → weighted composite.
@@ -878,8 +920,12 @@ def build_composite_from_blocks(
                 race_names = [r for r in _STATEWIDE_AVG_RACES if (year, r) in district_leans]
                 print(f"  Computed statewide_avg for {year}: mean of {race_names}")
 
+    # Default district set inferred from block-district map if caller didn't supply.
+    if all_districts is None:
+        all_districts = sorted(block_district_map["district_num"].unique().tolist())
+
     print(f"  Building composite from {len(district_leans)} race-year combinations …")
-    composite_df = build_composite(district_leans, weights=weights)
+    composite_df = build_composite(district_leans, weights=weights, all_districts=all_districts)
     return composite_df
 
 
@@ -918,7 +964,7 @@ def load_block_precinct_map(year: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def load_block_district_map(plan: str = "2024") -> pd.DataFrame:
+def load_block_district_map(plan: str = "house_2024") -> pd.DataFrame:
     """Load cached block → district map."""
     path = _block_district_map_path(plan)
     if not path.exists():

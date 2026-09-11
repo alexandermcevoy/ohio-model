@@ -1,0 +1,16 @@
+district,composite_lean,margin,sigma_i,inc_shift,win_prob,marginal_wp,tier,open_seat_2026,current_holder,incumbent_status_2026,target_mode,investment_rank
+10,0.0012,-0.0188,0.0333,0.0000,0.2863,10.2029,lean_r,False,R,true_incumbent,mobilization,1
+15,0.0044,-0.0156,0.0405,0.0000,0.3505,9.1392,lean_r,False,R,true_incumbent,mobilization,2
+1,0.0297,0.0097,0.0460,0.0000,0.5839,8.4893,lean_d,False,D,true_incumbent,structural,3
+7,-0.0042,-0.0242,0.0647,0.0000,0.3540,5.7503,lean_r,False,R,true_incumbent,persuasion,4
+9,0.0015,-0.0185,0.0756,0.0000,0.4035,5.1236,lean_r,False,D,true_incumbent,persuasion,5
+13,0.0708,0.0508,0.0491,0.0000,0.8499,4.7555,likely_d,False,D,true_incumbent,mobilization,6
+14,-0.0378,-0.0578,0.0429,0.0000,0.0888,3.7511,likely_r,False,R,true_incumbent,structural,7
+8,-0.0410,-0.0610,0.0371,0.0000,0.0498,2.7741,safe_r,False,R,true_incumbent,structural,8
+12,-0.0992,-0.1192,0.0834,0.0000,0.0763,1.7201,likely_r,False,R,true_incumbent,hybrid,9
+2,-0.1359,-0.1559,0.0821,0.0000,0.0288,0.8009,safe_r,False,R,true_incumbent,hybrid,10
+5,-0.0588,-0.0788,0.0327,0.0000,0.0079,0.6629,safe_r,False,R,true_incumbent,structural,11
+6,-0.0947,-0.1147,0.0421,0.0000,0.0032,0.2321,safe_r,False,R,true_incumbent,structural,12
+4,-0.1579,-0.1779,0.0336,0.0000,0.0000,0.0000,safe_r,False,R,true_incumbent,structural,13
+3,0.2449,0.2249,0.0311,0.0000,1.0000,0.0000,safe_d,False,D,true_incumbent,mobilization,14
+11,0.3284,0.3084,0.0327,0.0000,1.0000,0.0000,safe_d,False,D,true_incumbent,structural,15

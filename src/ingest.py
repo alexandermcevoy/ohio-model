@@ -99,15 +99,22 @@ def load_precincts(path: str | Path) -> gpd.GeoDataFrame:
     return gdf
 
 
-def load_districts(path: str | Path) -> gpd.GeoDataFrame:
+def load_districts(path: str | Path, expected_n: int | None = None) -> gpd.GeoDataFrame:
     """
-    Load Ohio House district shapefile and reproject.
+    Load a legislative district shapefile and reproject.
 
     Supports both:
       - Census TIGER/Line SLDL format (column: SLDLST)
       - Ohio SOS redistricting plan format (column: DISTRICT)
 
     Normalises to 'district_num' (integer) in either case.
+
+    Parameters
+    ----------
+    path : shapefile path
+    expected_n : optional district-count check (e.g. 99 for House, 33 for Senate,
+        15 for Congress). Pass `office.n_districts`. Defaults to 99 (Ohio House)
+        for backward compatibility.
     """
     path = Path(path)
     if not path.exists():
@@ -121,10 +128,12 @@ def load_districts(path: str | Path) -> gpd.GeoDataFrame:
 
     gdf = gdf.to_crs(TARGET_CRS)
 
-    # Confirm we have the expected 99 Ohio House districts
+    if expected_n is None:
+        expected_n = 99  # default = Ohio House
+
     n = len(gdf)
-    if n != 99:
-        print(f"  WARNING: Expected 99 districts, got {n}. Verify this is the SLDL layer.")
+    if n != expected_n:
+        print(f"  WARNING: Expected {expected_n} districts, got {n}. Verify this matches the office.")
 
     # Detect district number column — support Census TIGER/Line and Ohio SOS formats
     if "SLDLST" in gdf.columns:
