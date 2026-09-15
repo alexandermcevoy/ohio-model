@@ -3674,6 +3674,19 @@ def forecast_trend(
             match = next((c for c in summary.components if c.label == label), None)
             return getattr(match, field) if match is not None else None
 
+        # summary.weights is a separate tuple aligned by index with
+        # summary.components (each signal's share of total blend precision,
+        # 1/sigma^2) — not a field on EnvironmentSignal itself. Built as a
+        # label -> weight lookup here so the trend CSV can carry each
+        # signal's actual influence on the blend at that date, not just its
+        # value: a signal can read far from the blend and still be right,
+        # if its weight is low. Without this, forecast-trend's own output
+        # (and anything built from it, like the artifact's trend chart)
+        # shows four value lines with no way to tell which ones mattered —
+        # confirmed this reads as a discrepancy/bug to a viewer rather than
+        # normal precision-weighting behavior.
+        _weight_by_label = dict(zip((c.label for c in summary.components), summary.weights))
+
         rows.append({
             "as_of": as_of.date().isoformat(),
             "environment_d_pct": round(summary.ohio_value * 100, 2),
@@ -3687,6 +3700,10 @@ def forecast_trend(
             "n_gov_polls": _comp("governor_polls", "n"),
             "n_senate_polls": _comp("senate_polls", "n"),
             "n_generic_ballot_polls": _comp("national_fundamentals", "n"),
+            "national_fundamentals_wt": round(_weight_by_label.get("national_fundamentals", 0.0), 4),
+            "governor_polls_wt": round(_weight_by_label.get("governor_polls", 0.0), 4),
+            "senate_polls_wt": round(_weight_by_label.get("senate_polls", 0.0), 4),
+            "historical_governor_wt": round(_weight_by_label.get("historical_governor", 0.0), 4),
             "mean_seats": round(float(result.seat_counts.mean()), 2),
             "p10_seats": int(np.percentile(result.seat_counts, 10)),
             "p90_seats": int(np.percentile(result.seat_counts, 90)),
