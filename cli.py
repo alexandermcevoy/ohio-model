@@ -3754,6 +3754,175 @@ def congress_forecast(
                           include_historical=include_historical, seed=seed)
 
 
+# ---------------------------------------------------------------------------
+# Election-night nowcast (manual live returns -> posterior update)
+# ---------------------------------------------------------------------------
+
+def _run_election_night(
+    office_name: str,
+    n_sims: int = 10_000,
+    with_incumbency: bool = False,
+    seed: int = 42,
+):
+    """
+    Read data/raw/live_returns_{office}.csv (district, dem_votes, rep_votes,
+    is_final — user-typed, read off NYT/VoteHub/county results), condition
+    the pre-election joint distribution over every district's share on
+    whatever is currently filled in, and print/write the resulting posterior
+    win probabilities, call status, and unconditional seat forecast.
+
+    Every district's posterior moves when ANY district reports, not just the
+    ones with data — see src/nowcast.py module docstring for why: the same
+    sigma_shared/environment covariance every district already shares in the
+    pre-election model is exactly the mechanism that makes this correlated
+    updating fall out for free, rather than needing new machinery.
+
+    Not a replacement for AP/network calls: this is a fundamentals-anchored
+    posterior, and will disagree with an outside call in any district where
+    the pre-election model and the live count are in real tension. Rerun
+    after editing the CSV — there is no live polling loop.
+    """
+    import numpy as np
+    import pandas as pd
+    from src.forecast_statewide import build_forecast
+    from src.simulate import SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma
+    from src.nowcast import (
+        NowcastConfig, LiveObservation, build_prior, update_posterior,
+        win_probs_from_posterior, call_status, simulate_posterior_seats,
+        expected_total_votes,
+    )
+    from src.office import get_office
+
+    office = get_office(office_name)
+    if office.is_statewide:
+        typer.echo(f"  Office '{office.name}' is statewide; election-night nowcast not applicable here.")
+        raise typer.Exit(1)
+
+    targeting_path = Path(f"reports/session3/{office.output_prefix}_targeting.csv")
+    composite_path = Path(f"reports/session2/{office.output_prefix}_composite_lean.csv")
+    if not targeting_path.exists() or not composite_path.exists():
+        typer.echo(f"ERROR: run `{office.name} classify` and `{office.name} composite` first.", err=True)
+        raise typer.Exit(1)
+
+    targeting_df = pd.read_csv(targeting_path)
+    composite_df = pd.read_csv(composite_path)
+
+    config = SimConfig(n_sims=n_sims, include_incumbency=with_incumbency, random_seed=seed)
+    sigma_prior = compute_sigma_prior(composite_df)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
+
+    as_of = pd.Timestamp.now().normalize()
+    summary, _ = build_forecast(as_of=as_of, n_samples=n_sims)
+
+    nc_config = NowcastConfig()
+    mean, cov = build_prior(
+        targeting_df, sigma_df, summary.ohio_value, summary.ohio_sigma,
+        with_incumbency=with_incumbency,
+    )
+
+    returns_path = Path(f"data/raw/live_returns_{office.output_prefix}.csv")
+    observations: list[LiveObservation] = []
+    if returns_path.exists():
+        returns_df = pd.read_csv(returns_path)
+        for _, row in returns_df.iterrows():
+            dem_v = row.get("dem_votes", 0)
+            rep_v = row.get("rep_votes", 0)
+            dem_v = 0 if pd.isna(dem_v) else int(dem_v)
+            rep_v = 0 if pd.isna(rep_v) else int(rep_v)
+            if dem_v + rep_v <= 0:
+                continue
+            observations.append(LiveObservation(
+                district=int(row["district"]),
+                dem_votes=dem_v,
+                rep_votes=rep_v,
+                is_final=bool(row.get("is_final", False)) if not pd.isna(row.get("is_final", False)) else False,
+            ))
+    else:
+        returns_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"district": sorted(targeting_df["district"]), "dem_votes": "", "rep_votes": "", "is_final": False}) \
+            .to_csv(returns_path, index=False)
+        typer.echo(f"  No live returns file found — wrote a blank template to {returns_path}")
+        typer.echo("  Fill in dem_votes/rep_votes as results come in (is_final=True once certified), then rerun this command.\n")
+
+    exp_total = expected_total_votes(composite_df)
+    mean_post, cov_post = update_posterior(mean, cov, observations, exp_total, config=nc_config)
+
+    wp = win_probs_from_posterior(mean_post, cov_post)
+    wp["call"] = call_status(wp, observations, nc_config)
+    detail_cols = [c for c in ["district", "current_holder", "open_seat_2026"] if c in targeting_df.columns]
+    wp = wp.merge(targeting_df[detail_cols], on="district", how="left")
+    wp = wp.sort_values("win_prob", ascending=False).reset_index(drop=True)
+
+    seat_result = simulate_posterior_seats(mean_post, cov_post, n_sims=n_sims, seed=seed)
+
+    typer.echo(f"=== {office.display_name} — Election Night Nowcast ===\n")
+    typer.echo(f"  {len(observations)} district(s) with live returns entered "
+               f"({sum(o.is_final for o in observations)} certified).\n")
+    typer.echo("  Unconditional seat forecast (posterior):")
+    typer.echo(f"    Mean D seats: {seat_result['mean_seats']:.1f}   Median: {seat_result['median_seats']}")
+    typer.echo(f"    80% CI: [{seat_result['p10_seats']}, {seat_result['p90_seats']}]   Std: {seat_result['std_seats']:.2f}\n")
+
+    n_call_d = int((wp["call"].isin(["CALL D", "CERTIFIED D"])).sum())
+    n_call_r = int((wp["call"].isin(["CALL R", "CERTIFIED R"])).sum())
+    n_open = len(wp) - n_call_d - n_call_r
+    typer.echo(f"  Called D: {n_call_d}   Called R: {n_call_r}   Too close to call: {n_open}\n")
+
+    close_races = (
+        wp[~wp["call"].isin(["CERTIFIED D", "CERTIFIED R"])]
+        .assign(_dist=lambda d: (d["win_prob"] - 0.5).abs())
+        .sort_values("_dist")
+        .head(10)
+    )
+    if not close_races.empty:
+        typer.echo("  Closest races right now:")
+        for _, r in close_races.iterrows():
+            typer.echo(f"    District {int(r['district']):>3}  {r['win_prob']:6.1%} D win prob   [{r['call']}]")
+        typer.echo()
+
+    out_dir = Path(_DEFAULT_SESSION8_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / f"{office.output_prefix}_nowcast_district_detail.csv"
+    wp.to_csv(detail_path, index=False, float_format="%.4f")
+    typer.echo(f"  → {detail_path}")
+
+    typer.echo(
+        "\n  Note: tau_floor/tau_scale (how fast a partial count is trusted) are documented "
+        "judgment calls in src/nowcast.py::NowcastConfig, not fitted — there is no historical "
+        "archive of minute-by-minute Ohio State House reporting to calibrate against."
+    )
+
+
+@app.command("election-night")
+def house_election_night(
+    n_sims: int = typer.Option(10_000, "--n-sims"),
+    with_incumbency: bool = typer.Option(False, "--with-incumbency"),
+    seed: int = typer.Option(42, "--seed"),
+):
+    """Election-night live-returns posterior nowcast for Ohio State House. Top-level default; also `house election-night`."""
+    _run_election_night("house", n_sims=n_sims, with_incumbency=with_incumbency, seed=seed)
+
+
+@senate_app.command("election-night")
+def senate_election_night(
+    n_sims: int = typer.Option(10_000, "--n-sims"),
+    with_incumbency: bool = typer.Option(False, "--with-incumbency"),
+    seed: int = typer.Option(42, "--seed"),
+):
+    """Election-night live-returns posterior nowcast for Ohio State Senate."""
+    _run_election_night("senate", n_sims=n_sims, with_incumbency=with_incumbency, seed=seed)
+
+
+@congress_app.command("election-night")
+def congress_election_night(
+    n_sims: int = typer.Option(10_000, "--n-sims"),
+    with_incumbency: bool = typer.Option(False, "--with-incumbency"),
+    seed: int = typer.Option(42, "--seed"),
+):
+    """Election-night live-returns posterior nowcast for Ohio US House."""
+    _run_election_night("congress", n_sims=n_sims, with_incumbency=with_incumbency, seed=seed)
+
+
 @multi_app.command("backbone")
 def multi_backbone(
     build_all_maps: bool = typer.Option(
