@@ -67,6 +67,12 @@ def load_generic_ballot_polls(path: Path | str | None = None) -> pd.DataFrame:
     # quality weighting as the OH governor/Senate polls rather than mixing
     # in someone else's opaque house-effects adjustment for just one input.
     df["dem_two_party"] = df["dem"] / (df["dem"] + df["rep"])
+
+    # Silver Bulletin's own schema names this "samplesize" (no underscore)
+    # and has no separate undecided/other rows to drop — decided_frac comes
+    # straight from how much of the raw dem+rep topline is under 100.
+    df["sample_size"] = df["samplesize"]
+    df["decided_frac"] = (df["dem"] + df["rep"]) / 100.0
     return df
 
 
@@ -109,6 +115,7 @@ def load_approval_polls(path: Path | str | None = None) -> pd.DataFrame:
     df["end_date"] = pd.to_datetime(df["end_date"], format="%m/%d/%y", errors="coerce")
     df = df.dropna(subset=["yes", "no"])
     df["approve_share"] = df["yes"] / (df["yes"] + df["no"])
+    df["decided_frac"] = (df["yes"] + df["no"]) / 100.0
     return df
 
 

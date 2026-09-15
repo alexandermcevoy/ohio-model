@@ -182,7 +182,12 @@ with col2:
         scol1, scol2 = st.columns(2)
         scol1.markdown(f"**Investment Rank:** #{prob.get('investment_rank', 'n/a')}")
         scol2.markdown(f"**Marginal WP:** {prob.get('marginal_wp', 'n/a'):.2f}" if prob.get("marginal_wp") else "**Marginal WP:** n/a")
-        st.caption(f"sigma_i = {prob.get('sigma_i', 'n/a'):.4f} ({prob.get('sigma_source', 'n/a')})" if prob.get("sigma_i") else "")
+        st.caption(
+            f"Outcome noise σ = {prob['sigma_total']:.4f} "
+            f"(district-only σ_i = {prob['sigma_i']:.4f}, {prob.get('sigma_source', 'n/a')}; "
+            "the rest is the year-level shift shared by all districts)"
+            if prob.get("sigma_total") else ""
+        )
 
 # ---------------------------------------------------------------------------
 # Second row: voter universe + demographics

@@ -27,16 +27,23 @@ independent Gaussian estimates of one shared parameter, the standard
 combination is inverse-variance ("precision") weighting: each signal's
 weight is proportional to 1/sigma^2, so noisier signals contribute less
 without being discarded outright.
+
+Before blending, each race's poll average is put on the reference scale
+(src/composite.py REFERENCE_MIDTERM_RACES — the same "statewide D%" the
+House model is calibrated to) using that race's measured deviation from the
+reference in past Ohio cycles: see RACE_ADJUSTMENTS.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 
-from src.governor import build_baseline_distribution, compute_statewide_history
+from src.composite import reference_share
+from src.governor import PROCESSED, build_baseline_distribution, compute_statewide_history
 from src.ingest_polls import POLLS, load_polls, two_party_share, weighted_average
 from src.constants import POLL_PARTISAN_DISCOUNT, POLL_RECENCY_HALF_LIFE_DAYS
 from src.national_to_state import build_environment_prior
@@ -72,6 +79,10 @@ weighting without accounting for that shared risk understates the true
 final uncertainty. This floor is a blunt, documented guard against that
 overconfidence rather than a fitted correction — 2 points, the same order
 of magnitude as CANDIDATE_IDIOSYNCRASY_SIGMA below.
+
+Separate from simulate.compute_shared_sigma(): that term covers the House's
+offset from the reference race even when the reference is known exactly;
+this floor covers error in estimating the reference itself.
 """
 
 SINGLE_POLL_FALLBACK_SIGMA: float = 0.06
@@ -90,23 +101,96 @@ inventing a new number.
 
 CANDIDATE_IDIOSYNCRASY_SIGMA: float = 0.02
 """
-Additional uncertainty (in quadrature) applied to each individual race's
-polling average when treating it as a measurement of the SHARED generic
-environment, reflecting that a specific race's result is the environment
-plus a candidate-specific deviation, not the environment itself.
+Floor on the race-specific sigma added (in quadrature) to each race's
+polling average when treating it as a reading of the shared environment.
 
-NOT fit from data — no historical archive of within-cycle statewide races
-(e.g. governor vs. US Senate results in the same Ohio election year) is
-currently persisted anywhere in this repo; that comparison happens
-transiently inside the composite-lean pipeline (src/partisan.py) and isn't
-written to a reusable file (see CLAUDE.md Known Limitations). 0.02 (2 pts)
-is a round-number judgment call, informed by but not derived from this
-cycle's own observed gap between the OH governor and Senate polling
-averages (0.8-2.7 pts depending on weighting — see `build_forecast()`'s
-printed diagnostics). Treat this the same way as
-LITERATURE_INCUMBENCY_ADVANTAGE (src/constants.py): a documented estimate
-to revisit once better data exists, not a validated coefficient.
+The race-specific sigma is now measured rather than assumed: it is the
+predictive spread of that race's past deviations from the reference race,
+computed from the block vote surfaces (RACE_ADJUSTMENTS below). This 2-pt
+round number, the original judgment call, only applies if a measured spread
+comes in smaller.
 """
+
+
+@dataclass(frozen=True)
+class RaceAdjustment:
+    """How one statewide race's polls are translated to the reference scale."""
+
+    race: str                 # race label in block_votes_{year}.parquet, e.g. "uss"
+    cycles: tuple[int, ...]   # past Ohio cycles the deviation is measured over
+    apply_mean: bool          # subtract the mean deviation from the poll average?
+    basis: str                # plain-English description for printed output
+
+
+RACE_ADJUSTMENTS: dict[str, RaceAdjustment] = {
+    # Brown ran ahead of the reference race in all three of his prior Ohio
+    # races. The premium is his, not the Senate office's: Fisher (2010) and
+    # Strickland (2016) ran well BEHIND the rest of the ticket.
+    "us_senate": RaceAdjustment(
+        race="uss", cycles=(2012, 2018, 2024), apply_mean=True,
+        basis="Sherrod Brown's prior Ohio Senate races",
+    ),
+    # Acton has no Ohio electoral record, so no mean shift is applied (its
+    # sign is unknown). The spread of past governor races around the
+    # reference, with a different matchup each time, sets how noisy this
+    # race is as a reading of the environment.
+    "governor": RaceAdjustment(
+        race="gov", cycles=(2010, 2014, 2018, 2022), apply_mean=False,
+        basis="Ohio governor races 2010-2022; spread only, mean not applied",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class RaceDeviation:
+    """A race's measured deviation from the reference race in past cycles."""
+
+    race: str
+    basis: str
+    per_cycle: tuple[tuple[int, float], ...]  # (year, race share - reference share)
+    mean: float
+    predictive_sd: float   # sd * sqrt(1 + 1/n): spread of a NEW cycle's deviation
+    applied_offset: float  # subtracted from the poll average (0 when mean not applied)
+
+
+@lru_cache(maxsize=None)
+def _statewide_shares(year: int) -> dict[str, float]:
+    """Statewide two-party D share per race label ('uss', 'atg', ...) for one year."""
+    path = PROCESSED / f"block_votes_{year}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found — run `python cli.py backbone --build-surfaces`.")
+    df = pd.read_parquet(path, columns=["race", "d_votes", "r_votes"])
+    totals = df.groupby("race")[["d_votes", "r_votes"]].sum()
+    suffix = f"_{year}"
+    return {
+        race[: -len(suffix)]: float(d / (d + r))
+        for race, (d, r) in totals.iterrows()
+        if race.endswith(suffix) and d + r > 0
+    }
+
+
+def race_deviation(adj: RaceAdjustment) -> RaceDeviation:
+    """Measure `adj.race` against the reference race in each of `adj.cycles`."""
+    per_cycle = []
+    for year in adj.cycles:
+        shares = _statewide_shares(year)
+        if adj.race not in shares:
+            raise KeyError(f"Race '{adj.race}' not in block_votes_{year}.parquet")
+        per_cycle.append((year, shares[adj.race] - reference_share(shares, year)))
+    if len(per_cycle) < 2:
+        raise ValueError(f"Need >=2 cycles to measure a race deviation, got {adj.cycles}")
+
+    devs = np.array([d for _, d in per_cycle])
+    mean = float(devs.mean())
+    predictive_sd = float(devs.std(ddof=1) * np.sqrt(1 + 1 / len(devs)))
+    return RaceDeviation(
+        race=adj.race,
+        basis=adj.basis,
+        per_cycle=tuple(per_cycle),
+        mean=mean,
+        predictive_sd=predictive_sd,
+        applied_offset=mean if adj.apply_mean else 0.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -117,6 +201,7 @@ class EnvironmentSignal:
     mean: float
     sigma: float
     n: int  # n_polls, or n_cycles for the historical baseline
+    raw_mean: float | None = None  # poll signals: average before the race-to-reference adjustment
 
 
 @dataclass(frozen=True)
@@ -129,6 +214,7 @@ class ForecastSummary:
     method: str  # "precision_weighted_blend"
     components: tuple[EnvironmentSignal, ...]
     weights: tuple[float, ...]  # each signal's share of total precision; sums to 1.0
+    race_deviations: tuple[RaceDeviation, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +227,13 @@ def _oh_race_signal(
     rep_name: str,
     label: str,
     as_of: pd.Timestamp,
+    deviation: RaceDeviation,
 ) -> EnvironmentSignal:
     """
-    OH statewide race polling average, inflated by CANDIDATE_IDIOSYNCRASY_SIGMA
-    to reflect that this is a race-specific reading of the generic
-    environment, not the environment itself.
+    OH statewide race polling average put on the reference scale: minus the
+    race's measured mean deviation (when applied), with the race's measured
+    deviation spread (floored at CANDIDATE_IDIOSYNCRASY_SIGMA) added to the
+    poll spread in quadrature.
     """
     df = load_polls(path, state="OH", cycle=2026, stage="general")
     two_party = two_party_share(df, dem_name, rep_name)
@@ -158,8 +246,15 @@ def _oh_race_signal(
     )
     if np.isnan(poll_sigma):
         poll_sigma = SINGLE_POLL_FALLBACK_SIGMA
-    total_sigma = float(np.sqrt(poll_sigma**2 + CANDIDATE_IDIOSYNCRASY_SIGMA**2))
-    return EnvironmentSignal(label=label, mean=poll_mean, sigma=total_sigma, n=n)
+    race_sigma = max(deviation.predictive_sd, CANDIDATE_IDIOSYNCRASY_SIGMA)
+    total_sigma = float(np.sqrt(poll_sigma**2 + race_sigma**2))
+    return EnvironmentSignal(
+        label=label,
+        mean=poll_mean - deviation.applied_offset,
+        sigma=total_sigma,
+        n=n,
+        raw_mean=poll_mean,
+    )
 
 
 def _fundamentals_signal(as_of: pd.Timestamp) -> EnvironmentSignal:
@@ -219,11 +314,13 @@ def build_forecast(
 
     dem_gov, rep_gov = OHIO_2026_RACES["governor"]
     dem_sen, rep_sen = OHIO_2026_RACES["us_senate"]
+    gov_dev = race_deviation(RACE_ADJUSTMENTS["governor"])
+    sen_dev = race_deviation(RACE_ADJUSTMENTS["us_senate"])
 
     signals = [
         _fundamentals_signal(as_of),
-        _oh_race_signal(POLLS / "governor.csv", dem_gov, rep_gov, "governor_polls", as_of),
-        _oh_race_signal(POLLS / "senate.csv", dem_sen, rep_sen, "senate_polls", as_of),
+        _oh_race_signal(POLLS / "governor.csv", dem_gov, rep_gov, "governor_polls", as_of, gov_dev),
+        _oh_race_signal(POLLS / "senate.csv", dem_sen, rep_sen, "senate_polls", as_of, sen_dev),
     ]
     if include_historical_governor_baseline:
         signals.append(_historical_governor_signal())
@@ -243,6 +340,7 @@ def build_forecast(
         method="precision_weighted_blend",
         components=tuple(signals),
         weights=weights,
+        race_deviations=(gov_dev, sen_dev),
     )
 
     rng = np.random.default_rng(seed)
@@ -256,18 +354,30 @@ def print_forecast_summary(summary: ForecastSummary) -> None:
     print(f"Ohio 2026 generic environment forecast — as of {summary.as_of.date()}")
     print(f"Method: {summary.method}")
     print()
-    print(f"{'Signal':<22} {'Mean D%':>8} {'Sigma':>7} {'N':>6} {'Weight':>8}")
-    print("-" * 55)
+    print(f"{'Signal':<22} {'Raw D%':>7} {'Adj':>6} {'Mean D%':>8} {'Sigma':>7} {'N':>6} {'Weight':>8}")
+    print("-" * 70)
     for signal, weight in zip(summary.components, summary.weights):
+        raw = signal.raw_mean if signal.raw_mean is not None else signal.mean
         print(
-            f"{signal.label:<22} {signal.mean*100:>7.1f}% {signal.sigma*100:>6.2f}p "
+            f"{signal.label:<22} {raw*100:>6.1f}% {(signal.mean - raw)*100:>+5.1f}p "
+            f"{signal.mean*100:>7.1f}% {signal.sigma*100:>6.2f}p "
             f"{signal.n:>6} {weight*100:>7.1f}%"
         )
-    print("-" * 55)
+    print("-" * 70)
     print(
-        f"{'BLENDED':<22} {summary.ohio_value*100:>7.1f}% "
+        f"{'BLENDED':<22} {'':>7} {'':>6} {summary.ohio_value*100:>7.1f}% "
         f"{summary.ohio_sigma*100:>6.2f}p"
     )
+    if summary.race_deviations:
+        print("\nRace vs. reference race in past Ohio cycles (race D% minus reference D%):")
+        for dev in summary.race_deviations:
+            cycles = ", ".join(f"{y} {d*100:+.1f}" for y, d in dev.per_cycle)
+            applied = (f"mean {dev.applied_offset*100:+.1f} subtracted"
+                       if dev.applied_offset else "mean not applied")
+            print(
+                f"  {dev.race}: {cycles} -> mean {dev.mean*100:+.1f}, "
+                f"predictive sd {dev.predictive_sd*100:.1f} pts; {applied}  [{dev.basis}]"
+            )
     if abs(summary.ohio_sigma - MIN_OHIO_SIGMA) < 1e-9:
         print(
             f"  (sigma floored at {MIN_OHIO_SIGMA*100:.1f} pts — the naive "

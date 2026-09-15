@@ -38,7 +38,10 @@ with st.sidebar:
         min_value=40.0, max_value=55.0, step=0.5,
         value=st.session_state["statewide_d"],
         help="Set the assumed statewide two-party Democratic share. "
-             "This is a planning assumption, not a prediction.",
+             "This is a planning assumption, not a prediction. "
+             "Measured on the model's reference race: the president in "
+             "presidential years, the average of the AG/Auditor/Secretary of "
+             "State/Treasurer races in midterms (not the governor race).",
     )
 
     st.divider()

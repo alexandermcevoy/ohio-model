@@ -180,6 +180,7 @@ def get_district_data(
                 sr = sigma_df[sigma_df["district"] == district]
                 if not sr.empty:
                     prob_data["sigma_i"] = float(sr["sigma_i"].iloc[0])
+                    prob_data["sigma_total"] = float(sr["sigma_total"].iloc[0])
                     prob_data["sigma_source"] = str(sr["sigma_source"].iloc[0])
             if investment_df is not None:
                 ir = investment_df[investment_df["district"] == district]

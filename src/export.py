@@ -329,6 +329,7 @@ def _get_district_data(
                 sr = sigma_df[sigma_df["district"] == district]
                 if not sr.empty:
                     prob_data["sigma_i"] = float(sr["sigma_i"].iloc[0])
+                    prob_data["sigma_total"] = float(sr["sigma_total"].iloc[0])
                     prob_data["sigma_source"] = str(sr["sigma_source"].iloc[0])
             # Investment rank
             if investment_df is not None:
@@ -586,8 +587,14 @@ def _build_district_flowables(data: dict[str, Any], styles: dict) -> list:
             prob_rows.append(("Investment priority", f"#{prob['investment_rank']}"))
         if "marginal_wp" in prob:
             prob_rows.append(("Marginal WP", f"{prob['marginal_wp']:.3f}"))
-        if "sigma_i" in prob:
-            prob_rows.append(("σ (outcome noise)", f"{prob['sigma_i']:.4f} ({prob.get('sigma_source', '')})"))
+        if "sigma_total" in prob:
+            # sigma_total is what the win probabilities above are computed with;
+            # sigma_i alone (district-only noise) would not reproduce them.
+            prob_rows.append((
+                "σ (outcome noise)",
+                f"{prob['sigma_total']:.4f} (district-only {prob['sigma_i']:.4f}, "
+                f"{prob.get('sigma_source', '')})",
+            ))
         prob_section = section("PROBABILISTIC OUTLOOK", prob_rows)
 
     right_col_items = [demo_section, Spacer(1, 5), model_section, Spacer(1, 5), target_section]
@@ -1917,12 +1924,10 @@ def generate_office_summary(
             row.append("✓" if int(r["district"]) in seats_up_set else "")
         full_rows.append(row)
 
-    # Split into 2 or 3 columns if the table is long
-    n_cols_in_row = 2 if len(districts) > 20 else 1
-    if n_cols_in_row == 1:
+    def _full_width_table(rows):
         cw = [(PAGE_W - 2 * MARGIN) / len(full_header)] * len(full_header)
-        tbl = Table(full_rows, colWidths=cw, repeatRows=1)
-        tbl.setStyle(TableStyle([
+        t = Table(rows, colWidths=cw, repeatRows=1)
+        t.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 7.5),
             ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
@@ -1932,7 +1937,18 @@ def generate_office_summary(
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]))
-        flow.append(tbl)
+        return t
+
+    # Split into a side-by-side two-column layout if the table is long enough
+    # that a single column would waste space — but a side-by-side pair is
+    # wrapped in a 1-row outer Table, which reportlab can never split across
+    # pages (it isn't a per-row split point). If either half is too tall to
+    # fit on a completely fresh page, fall back to one full-width table:
+    # a plain Table with repeatRows DOES split across as many pages as
+    # needed, which is what a 99-district chamber (e.g. the House) requires.
+    n_cols_in_row = 2 if len(districts) > 20 else 1
+    if n_cols_in_row == 1:
+        flow.append(_full_width_table(full_rows))
     else:
         # Two-column layout: split body rows in half
         body = full_rows[1:]
@@ -1957,14 +1973,28 @@ def generate_office_summary(
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
             ]))
             return t
-        outer = Table([[mk(left_rows), mk(right_rows)]],
-                      colWidths=[(PAGE_W - 2 * MARGIN) / 2] * 2)
-        outer.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        flow.append(outer)
+        left_tbl, right_tbl = mk(left_rows), mk(right_rows)
+
+        # A fresh page's usable frame height: page height minus top/bottom
+        # margins minus SimpleDocTemplate's default 6pt frame padding on
+        # each side.
+        max_frame_h = PAGE_H - 2 * MARGIN - 12
+        _, left_h = left_tbl.wrap(sub_col_w[0] * len(sub_col_w), 1e6)
+        _, right_h = right_tbl.wrap(sub_col_w[0] * len(sub_col_w), 1e6)
+        if max(left_h, right_h) > max_frame_h:
+            # Too tall to ever fit side-by-side, even on an empty page.
+            # Fall back to a single full-width table, which reportlab can
+            # split across multiple pages via repeatRows.
+            flow.append(_full_width_table(full_rows))
+        else:
+            outer = Table([[left_tbl, right_tbl]],
+                          colWidths=[(PAGE_W - 2 * MARGIN) / 2] * 2)
+            outer.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            flow.append(outer)
 
     # ── Footer ───────────────────────────────────────────────────────────────
     flow.append(Spacer(1, 6))

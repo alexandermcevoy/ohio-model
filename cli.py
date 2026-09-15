@@ -122,7 +122,7 @@ def run_composite(
     from src.join_sos_vest import build_county_lookup, join_sos_to_vest, crosscheck_vest_sos_2020
     from src.ingest_race_results import parse_race_results, combine_race_results
     from src.office import HOUSE
-    from src.composite import build_composite, merge_composite_with_house_results
+    from src.composite import build_composite, compute_year_baselines, merge_composite_with_house_results
 
     typer.echo("=== Ohio House Model — Session 2: Composite Lean ===\n")
 
@@ -238,18 +238,11 @@ def run_composite(
     typer.echo("\nBuilding composite lean index …")
     composite_df = build_composite(district_leans)
 
-    # Year baselines for candidate effect: statewide D 2-party share from the
-    # primary reference race each cycle (presidential 2020/2024, gov 2022/2018).
+    # Year baselines for candidate effect: the reference statewide D 2-party
+    # share each cycle (president in presidential years, mean of AG/Aud/SOS/
+    # Treas in midterms — see src/composite.py REFERENCE_MIDTERM_RACES).
     # 2020 presidential comes from VEST (already validated exact match with SOS).
-    _BASELINE_RACE = {"2024": "pre", "2022": "gov", "2018": "gov"}
-    year_baselines: dict[str, float] = {}
-    for _yr, _race in _BASELINE_RACE.items():
-        _sos = sos_files.get(_yr)
-        if _sos and _race in _sos.statewide:
-            _rd = get_race_df(_sos, _race)
-            _d, _r = _rd["d_votes"].sum(), _rd["r_votes"].sum()
-            if _d + _r > 0:
-                year_baselines[_yr] = float(_d / (_d + _r))
+    year_baselines = compute_year_baselines(sos_files)
     if vest_vote_cols:
         _d20 = float(vest_gdf["G20PREDBID"].sum())
         _r20 = float(vest_gdf["G20PRERTRU"].sum())
@@ -386,16 +379,18 @@ def run_classify(
 
     # ── Compute district uncertainty (sigma) for WP-based tiers ──────────────
     typer.echo("\nComputing district uncertainty for WP-based tiers …")
-    from src.simulate import compute_sigma_prior, estimate_district_sigma
+    from src.simulate import compute_sigma_prior, compute_shared_sigma, estimate_district_sigma
     from src.classify import compute_swing_metrics as _csm
 
     sigma_prior = compute_sigma_prior(composite_df)
-    typer.echo(f"  Sigma prior (pooled candidate effect std): {sigma_prior:.4f}")
+    sigma_shared = compute_shared_sigma(composite_df)
+    typer.echo(f"  Sigma prior (within-year candidate effect std): {sigma_prior:.4f}  |  "
+               f"shared year sigma: {sigma_shared:.4f}")
 
     # Compute swing metrics on a scratch copy so we can estimate sigma before
     # the full classify pass.  compute_swing_metrics needs district + composite_lean.
     _swing_tmp = _csm(composite_df.copy(), house_long)
-    sigma_df = estimate_district_sigma(_swing_tmp, sigma_prior)
+    sigma_df = estimate_district_sigma(_swing_tmp, sigma_prior, sigma_shared=sigma_shared)
     typer.echo(f"  Sigma range: {sigma_df['sigma_i'].min():.4f} – {sigma_df['sigma_i'].max():.4f}")
 
     # ── Build targeting DataFrame ─────────────────────────────────────────────
@@ -551,7 +546,7 @@ def run_session4(
     from src.join_sos_vest import build_county_lookup, join_sos_to_vest, crosscheck_vest_sos_2020
     from src.ingest_race_results import parse_race_results, combine_race_results
     from src.office import HOUSE
-    from src.composite import build_composite, merge_composite_with_house_results
+    from src.composite import build_composite, compute_year_baselines, merge_composite_with_house_results
     from src.demographics import build_district_demographics
     from src.model import run_regression, format_regression_summary
     from src.classify import build_targeting_df
@@ -711,15 +706,7 @@ def run_session4(
     typer.echo("\nBuilding composite lean index (pop-weighted) …")
     composite_df = build_composite(district_leans)
 
-    _BASELINE_RACE = {"2024": "pre", "2022": "gov", "2018": "gov"}
-    year_baselines: dict[str, float] = {}
-    for _yr, _race in _BASELINE_RACE.items():
-        _sos = sos_files.get(_yr)
-        if _sos and _race in _sos.statewide:
-            _rd = get_race_df(_sos, _race)
-            _d, _r = _rd["d_votes"].sum(), _rd["r_votes"].sum()
-            if _d + _r > 0:
-                year_baselines[_yr] = float(_d / (_d + _r))
+    year_baselines = compute_year_baselines(sos_files)
     if vest_vote_cols:
         _d20 = float(vest_gdf["G20PREDBID"].sum())
         _r20 = float(vest_gdf["G20PRERTRU"].sum())
@@ -999,7 +986,7 @@ def run_targets(
 
 @app.command("scenario")
 def run_scenario(
-    statewide_d: float = typer.Option(None, "--statewide-d", help="Statewide D two-party share (e.g. 48.5 for 48.5%)."),
+    statewide_d: float = typer.Option(None, "--statewide-d", help="Statewide D two-party share on the reference race (president; midterms: AG/Aud/SOS/Treas mean), e.g. 48.5."),
     targeting: str = typer.Option(_DEFAULT_TARGETING, help="Targeting CSV."),
     scenarios: str = typer.Option(_DEFAULT_SCENARIOS, help="Scenario table CSV."),
 ):
@@ -1823,7 +1810,8 @@ _DEFAULT_SESSION8_DIR = "reports/session8"
 @app.command("simulate")
 def run_simulate(
     statewide_d: float = typer.Option(None, "--statewide-d",
-        help="Statewide D% (e.g. 48.5). If omitted, runs full 40–55% sweep."),
+        help="Statewide D% on the reference race (president; midterms: AG/Aud/SOS/Treas mean), "
+             "e.g. 48.5. If omitted, runs full 40–55% sweep."),
     n_sims: int = typer.Option(10_000, "--n-sims", help="Number of Monte Carlo simulations."),
     with_incumbency: bool = typer.Option(False, "--with-incumbency",
         help="Apply literature incumbency adjustment for 2026 (confirmed districts only)."),
@@ -1840,7 +1828,7 @@ def run_simulate(
     """
     import pandas as pd
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma,
         run_simulations, run_probabilistic_scenario_table,
         build_investment_priority, build_district_win_prob_table,
     )
@@ -1856,7 +1844,8 @@ def run_simulate(
 
     # Estimate district-level uncertainty
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
 
     typer.echo(f"σ_prior (pooled candidate effect std): {sigma_prior:.4f}")
     typer.echo(f"Incumbency adjustment: {'ON (confirmed only)' if with_incumbency else 'OFF'}")
@@ -1929,7 +1918,8 @@ def run_simulate(
 @app.command("invest")
 def run_invest(
     statewide_d: float = typer.Option(48.0, "--statewide-d",
-        help="Assumed statewide D environment (e.g. 48.0)."),
+        help="Assumed statewide D environment on the reference race "
+             "(president; midterms: AG/Aud/SOS/Treas mean), e.g. 48.0."),
     target_seats: int = typer.Option(40, "--target",
         help="Seat target to optimize toward."),
     max_districts: int = typer.Option(15, "--max-districts",
@@ -1947,7 +1937,7 @@ def run_invest(
     """
     import pandas as pd
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma,
         optimize_path_to_target,
     )
 
@@ -1962,7 +1952,8 @@ def run_invest(
     sw = statewide_d / 100.0 if statewide_d > 1 else statewide_d
 
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
 
     typer.echo(f"=== Path to {target_seats} seats at {sw:.1%} statewide D ===\n")
     typer.echo(f"Investment delta: {config.investment_delta:.0%} lean shift per unit")
@@ -2002,7 +1993,8 @@ def run_win_prob(
     district: int = typer.Option(None, "--district",
         help="Show win probability curve for a single district."),
     statewide_d: float = typer.Option(None, "--statewide-d",
-        help="Show all district win probs at this environment."),
+        help="Show all district win probs at this statewide D% (reference race: "
+             "president; midterms: AG/Aud/SOS/Treas mean)."),
     with_incumbency: bool = typer.Option(False, "--with-incumbency"),
     targeting: str = typer.Option(_DEFAULT_TARGETING, help="Targeting CSV."),
     composite: str = typer.Option(_DEFAULT_COMPOSITE, help="Composite lean CSV."),
@@ -2016,7 +2008,7 @@ def run_win_prob(
     """
     import pandas as pd
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma,
         compute_analytical_win_probs, district_win_prob_curve,
     )
 
@@ -2025,7 +2017,8 @@ def run_win_prob(
 
     config = SimConfig(include_incumbency=with_incumbency)
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
 
     if district is not None:
         # Single district curve
@@ -2092,7 +2085,7 @@ def run_session8(
     """
     import pandas as pd
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma,
         run_probabilistic_scenario_table, build_investment_priority,
         build_district_win_prob_table, run_defensive_scenarios,
         optimize_path_to_target,
@@ -2115,8 +2108,9 @@ def run_session8(
     # 1. Sigma estimation
     typer.echo("Step 1: Estimating district-level uncertainty …")
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
-    typer.echo(f"  σ_prior = {sigma_prior:.4f}")
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
+    typer.echo(f"  σ_prior (within-year) = {sigma_prior:.4f}  |  shared year σ = {sigma_shared:.4f}")
     for source, count in sigma_df["sigma_source"].value_counts().items():
         typer.echo(f"  {source}: {count} districts")
 
@@ -2960,7 +2954,7 @@ def _run_office_composite_backbone(office_name: str):
     """Build composite_lean + race-history CSV for a non-house office via backbone."""
     import json
     from src.backbone import load_block_district_map, build_composite_from_blocks
-    from src.composite import merge_composite_with_house_results
+    from src.composite import compute_year_baselines, merge_composite_with_house_results
     from src.ingest_sos import load_sos_file, get_race_df
     from src.ingest_race_results import parse_race_results, combine_race_results
     from src.office import get_office
@@ -2989,10 +2983,12 @@ def _run_office_composite_backbone(office_name: str):
     # Parse this office's race history from each SOS XLSX year.
     typer.echo(f"\n  Aggregating {office.display_name} race results …")
     race_results_list = []
+    sos_loaded: dict[str, object] = {}
     for year, path in SOS_FILES.items():
         if not Path(path).exists():
             continue
         sos = load_sos_file(path)
+        sos_loaded[year] = sos
         rr = parse_race_results(sos, office)
         if not rr.empty:
             race_results_list.append(rr)
@@ -3003,19 +2999,9 @@ def _run_office_composite_backbone(office_name: str):
     )
     race_wide = combine_race_results(race_results_list) if race_results_list else __import__("pandas").DataFrame()
 
-    # Year baselines for candidate effect (same statewide reference races as house).
-    year_baselines: dict[str, float] = {}
-    _BASELINE_RACE = {"2024": "pre", "2022": "gov", "2020": "pre", "2018": "gov"}
-    for _yr, _race in _BASELINE_RACE.items():
-        path = SOS_FILES.get(_yr)
-        if not path or not Path(path).exists():
-            continue
-        sos = load_sos_file(path)
-        if _race in sos.statewide:
-            _rd = get_race_df(sos, _race)
-            _d, _r = _rd["d_votes"].sum(), _rd["r_votes"].sum()
-            if _d + _r > 0:
-                year_baselines[_yr] = float(_d / (_d + _r))
+    # Year baselines for candidate effect (same reference races as house —
+    # see src/composite.py REFERENCE_MIDTERM_RACES).
+    year_baselines = compute_year_baselines(sos_loaded)
 
     available_years = [y for y in SOS_FILES if Path(SOS_FILES[y]).exists()]
     final_df = merge_composite_with_house_results(
@@ -3083,7 +3069,7 @@ def _run_office_classify(office_name: str):
         REFERENCE_ENVIRONMENTS,
         compute_swing_metrics,
     )
-    from src.simulate import compute_sigma_prior, estimate_district_sigma
+    from src.simulate import compute_sigma_prior, compute_shared_sigma, estimate_district_sigma
     from src.scenarios import (
         run_scenario_table,
         build_pickup_ladder,
@@ -3122,9 +3108,11 @@ def _run_office_classify(office_name: str):
     # Sigma_i: pooled-prior + EB shrinkage by n_contested.
     typer.echo("\n  Computing district uncertainty (sigma_i) …")
     sigma_prior = compute_sigma_prior(composite_df)
-    typer.echo(f"    Sigma prior (pooled candidate effect std): {sigma_prior:.4f}")
+    sigma_shared = compute_shared_sigma(composite_df)
+    typer.echo(f"    Sigma prior (within-year candidate effect std): {sigma_prior:.4f}  |  "
+               f"shared year sigma: {sigma_shared:.4f}")
     _swing_tmp = compute_swing_metrics(composite_df.copy(), race_long)
-    sigma_df = estimate_district_sigma(_swing_tmp, sigma_prior)
+    sigma_df = estimate_district_sigma(_swing_tmp, sigma_prior, sigma_shared=sigma_shared)
     typer.echo(
         f"    Sigma range: {sigma_df['sigma_i'].min():.4f} – {sigma_df['sigma_i'].max():.4f}"
     )
@@ -3243,7 +3231,7 @@ def _run_office_simulate(office_name: str, n_sims: int = 10_000,
                           with_incumbency: bool = False, seed: int = 42):
     import pandas as pd
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma,
         run_probabilistic_scenario_table, build_district_win_prob_table,
         build_investment_priority,
     )
@@ -3276,9 +3264,11 @@ def _run_office_simulate(office_name: str, n_sims: int = 10_000,
     )
 
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
 
-    typer.echo(f"  σ_prior (pooled candidate effect std): {sigma_prior:.4f}")
+    typer.echo(f"  σ_prior (within-year candidate effect std): {sigma_prior:.4f}  |  "
+               f"shared year σ: {sigma_shared:.4f}")
     typer.echo(f"  Incumbency adjustment: {'ON (confirmed only)' if with_incumbency else 'OFF'}")
     typer.echo(f"  Simulations per environment: {n_sims:,}")
     typer.echo(f"  σ range: {sigma_df['sigma_i'].min():.4f} – {sigma_df['sigma_i'].max():.4f}\n")
@@ -3401,7 +3391,7 @@ def _run_office_forecast(
     import pandas as pd
     from src.forecast_statewide import build_forecast, print_forecast_summary
     from src.simulate import (
-        SimConfig, compute_sigma_prior, estimate_district_sigma, run_simulations,
+        SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma, run_simulations,
         compute_analytical_win_probs,
     )
     from src.office import get_office
@@ -3430,7 +3420,8 @@ def _run_office_forecast(
 
     config = SimConfig(n_sims=n_sims, include_incumbency=with_incumbency, random_seed=seed)
     sigma_prior = compute_sigma_prior(composite_df)
-    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+    sigma_shared = compute_shared_sigma(composite_df)
+    sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
 
     # The blended Ohio environment — one posterior shared across all three
     # chamber offices (see src/forecast_statewide.py module docstring).
@@ -3507,7 +3498,7 @@ def _run_office_forecast(
     # Per-district detail at the SAME blended environment (mean + sigma) and
     # SAME config (incumbency setting) as the seat distribution above —
     # margin = env + composite_lean + inc_shift, sigma = sqrt(env_sigma^2 +
-    # sigma_i^2), computed analytically (exact under the model; no need for
+    # sigma_i^2 + sigma_shared^2), computed analytically (exact under the model; no need for
     # per-simulation arrays — see src/simulate.py::compute_analytical_win_probs
     # docstring). Verified this reconciles with the Monte Carlo run above:
     # sum(win_prob) lands within 0.1 seat of result.mean_seats.
@@ -3536,7 +3527,7 @@ def _run_office_forecast(
     district_detail["tier"] = district_detail["win_prob"].apply(assign_tier_from_wp)
     district_detail["margin_mean"] = summary.ohio_value + district_detail["composite_lean"] + district_detail["inc_shift"]
     district_detail["margin_sigma"] = np.sqrt(
-        sigma_df.set_index("district")["sigma_i"].reindex(district_detail["district"]).values ** 2
+        sigma_df.set_index("district")["sigma_total"].reindex(district_detail["district"]).values ** 2
         + summary.ohio_sigma ** 2
     )
     # Overlay ballot facts on top of the untouched fundamentals win_prob.
@@ -3613,7 +3604,7 @@ def forecast_trend(
     import numpy as np
     import pandas as pd
     from src.forecast_statewide import build_forecast
-    from src.simulate import SimConfig, compute_sigma_prior, estimate_district_sigma, run_simulations
+    from src.simulate import SimConfig, compute_sigma_prior, compute_shared_sigma, estimate_district_sigma, run_simulations
     from src.office import get_office
     from src.ballot_overrides import overrides_for_office
 
@@ -3631,6 +3622,7 @@ def forecast_trend(
     targeting_df = pd.read_csv(targeting_path)
     composite_df = pd.read_csv(composite_path)
     sigma_prior = compute_sigma_prior(composite_df)
+    sigma_shared = compute_shared_sigma(composite_df)
 
     overrides = overrides_for_office(office.name)
     override_districts = [d for d in overrides if d in set(targeting_df["district"])]
@@ -3657,7 +3649,7 @@ def forecast_trend(
     rows = []
     for i, as_of in enumerate(dates):
         config = SimConfig(n_sims=n_sims, random_seed=seed + i)
-        sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config)
+        sigma_df = estimate_district_sigma(targeting_df, sigma_prior, config, sigma_shared=sigma_shared)
         sim_sigma = sigma_df[~sigma_df["district"].isin(override_districts)] if override_districts else sigma_df
 
         try:
@@ -3690,6 +3682,8 @@ def forecast_trend(
             "governor_polls_pct": round(_comp("governor_polls", "mean") * 100, 2) if _comp("governor_polls", "mean") is not None else None,
             "senate_polls_pct": round(_comp("senate_polls", "mean") * 100, 2) if _comp("senate_polls", "mean") is not None else None,
             "historical_governor_pct": round(_comp("historical_governor", "mean") * 100, 2) if _comp("historical_governor", "mean") is not None else None,
+            "governor_polls_raw_pct": round(_comp("governor_polls", "raw_mean") * 100, 2) if _comp("governor_polls", "raw_mean") is not None else None,
+            "senate_polls_raw_pct": round(_comp("senate_polls", "raw_mean") * 100, 2) if _comp("senate_polls", "raw_mean") is not None else None,
             "n_gov_polls": _comp("governor_polls", "n"),
             "n_senate_polls": _comp("senate_polls", "n"),
             "n_generic_ballot_polls": _comp("national_fundamentals", "n"),

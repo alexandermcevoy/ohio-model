@@ -161,7 +161,7 @@ This tool is being built to become durable analytical infrastructure for Ohio De
 **Full vision and positioning:** See `VISION.md` for the strategic case, 
 intended audience, and pitch framing. See `roadmap.md` for execution plan.
 
-**Current state (v3.0 in progress):** Composite partisan lean validated against DRA (ρ = 0.9985), win-probability tiers at 3 reference environments (Cook-style), fundamentals-only uniform swing scenarios + probabilistic Monte Carlo scenarios with district-level uncertainty, GLM regression (exploratory), ACS demographics, voter file integration, resource allocation optimizer, PDF district profiles with probabilistic outlook, Streamlit GUI, historical backtest (98% accuracy), block backbone architecture (8 election cycles 2010–2024), CLI with multi-office subcommand groups, anomaly detection, drop-one sensitivity, full three-map redistricting filter, CLAUDE.md data schema. **Phase A multi-office expansion in progress** (Session 14): composite/classify/simulate pipeline working end-to-end for State Senate (33 districts) and US House (15 CDs, NEW Oct 2025 plan). Validation, PDF profiles, and GUI extension still pending.
+**Current state (v3.0 in progress):** Composite partisan lean validated against DRA (ρ = 0.9985), win-probability tiers at 3 reference environments (Cook-style), fundamentals-only uniform swing scenarios + probabilistic Monte Carlo scenarios with district-level uncertainty, GLM regression (exploratory), ACS demographics, voter file integration, resource allocation optimizer, PDF district profiles with probabilistic outlook, Streamlit GUI, historical backtest (Brier skill 0.89 vs. a coin-flip baseline; binary accuracy is not a meaningful headline — see Session 12), block backbone architecture (8 election cycles 2010–2024), CLI with multi-office subcommand groups, anomaly detection, drop-one sensitivity, full three-map redistricting filter, CLAUDE.md data schema. **Phase A multi-office expansion in progress** (Session 14): composite/classify/simulate pipeline working end-to-end for State Senate (33 districts) and US House (15 CDs, NEW Oct 2025 plan). Validation, PDF profiles, and GUI extension still pending.
 
 **In flight (v3.0): Public-facing four-office forecast.** Strategic pivot from House-only conditional projection model (where the user supplies statewide D% via a slider) to a published forecast covering Governor 2026, State House, State Senate, and US House. Audience pivot: from private analytical tool pitched to ODP leadership → public forecast for political analytics consulting credibility + indirect ODP pressure via being the de facto Ohio forecast that reporters cite. Four phases:
 - **Phase A — Office expansion foundation** (Session 14, ~80% complete): same conditional-projection model, but for 4 offices instead of 1. `OfficeConfig` abstraction, SOS parser extension for senate/congress, block-district maps for new offices, CLI subcommand groups per office.
@@ -184,7 +184,7 @@ Full plan at `~/.claude/plans/iterative-coalescing-candle.md`.
 
 **Redistricting context:** Ohio used three different district maps in our data window. Pre-2020 (old maps), 2022 (interim maps struck down by Ohio Supreme Court but used for elections), 2024 (final maps adopted September 2023). Any cross-year comparison of house race results must account for which map was in effect. See `reports/redistricting_overlap.csv` for per-district reliability flags. The composite lean is unaffected because it routes through the spatial crosswalk, not district numbers.
 
-**2026 targeting intelligence:** Multiple top pickup targets are open seats in 2026 due to term limits and retirements (Districts 31, 35, 39, 44, 52 confirmed). Open seat status is tracked in the targeting CSV and should be prominently surfaced in all targeting outputs. The incumbency advantage (~6-8 points) disappearing from these seats is the single largest shift in win probability available. The probabilistic model classifies targets into a **pickup portfolio**: Core (7 districts viable across all plausible environments), Stretch (5 districts viable in good cycles), and Long-Shot (6 districts, wave only). See `reports/session8/README.md` for the full portfolio analysis.
+**2026 targeting intelligence:** Multiple top pickup targets are open seats in 2026 due to term limits and retirements (Districts 31, 35, 39, 44, 52 confirmed). Open seat status is tracked in the targeting CSV and should be prominently surfaced in all targeting outputs. The incumbency advantage (~6-8 points) disappearing from these seats is the single largest shift in win probability available. The probabilistic model classifies targets into a **pickup portfolio** (`gui/compute.py::classify_portfolio`): Core (6 districts: 31, 35, 36, 49, 52, 64), Stretch (5: 17, 32, 39, 60, 72), and Long-Shot (6: 29, 37, 44, 73, 75, 89), as of the 2026-09-11 σ recalibration (before it: 7 Core incl. 17, 5 Stretch, 7 Long-Shot). HD-64 has no Democratic nominee in 2026 (`src/ballot_overrides.py`); that override is only applied inside `forecast` so far. `reports/session8/README.md` has the original portfolio write-up; its numbers predate the recalibration.
 
 ## Data Sources
 
@@ -230,7 +230,7 @@ Weighted average of individual race leans across multiple years and offices. Def
 Gubernatorial years weighted more heavily than presidential because turnout composition is closer to a state house election. If a race/year is unavailable, its weight is redistributed proportionally among available races. The effective weights are documented in every output.
 
 ### Candidate Effect
-For contested state house races: actual D share minus composite partisan lean. Measures how much a candidate over/underperformed district fundamentals. Only meaningful for contested races; uncontested races are flagged but excluded from this calculation.
+For contested state house races: actual D share minus (reference statewide D share for that cycle + composite lean). The reference race is the president in presidential years and the unweighted mean of AG/Auditor/SOS/Treasurer in midterms (`REFERENCE_MIDTERM_RACES` in `src/composite.py`; the governor was the midterm reference until 2026-09-11). Measures how much a candidate over/underperformed district fundamentals. Only meaningful for contested races; uncontested races are flagged but excluded from this calculation.
 
 ## Data Schema
 
@@ -405,7 +405,7 @@ Summary: old→interim — 71 relocated, 15 redrawn, 13 same. Interim→final �
 
 ### `reports/anomaly_flags.csv` — flagged house result outliers
 
-Populated by `src/validate.py::detect_anomalies()`. Currently 10 rows (all 2022, all redistricting_artifact).
+Populated by `src/validate.py::detect_anomalies()`. Currently 2 rows (both 2022, both redistricting_artifact). There were 10 before the 2026-09-11 reference-race change, which moved the 2022 baseline up 3.2 pts and shrank 2022 residuals accordingly.
 
 | Column | Type | Description |
 |---|---|---|
@@ -437,10 +437,10 @@ Populated by `src/validate.py::detect_anomalies()`. Currently 10 rows (all 2022,
 ### `data/processed/year_baselines.json`
 
 ```json
-{"2018": 0.4807, "2020": 0.4592, "2022": 0.3746, "2024": 0.4434}
+{"2018": 0.4772, "2020": 0.4592, "2022": 0.4067, "2024": 0.4434}
 ```
 
-Statewide two-party D share for the reference race each cycle (governor for midterms, president for presidential years). Used to compute expected D share in anomaly detection and candidate effects.
+Reference statewide two-party D share each cycle: president in presidential years, mean of AG/Auditor/SOS/Treasurer in midterms (`src/composite.py::compute_year_baselines`). Used to compute expected D share in anomaly detection and candidate effects. Until 2026-09-11 midterms used the governor (2018: 0.4807, 2022: 0.3746).
 
 ---
 
@@ -538,12 +538,26 @@ One row per district (99 rows), at a reference statewide environment (default 48
 | `district` | int | District number |
 | `composite_lean` | float | For reference |
 | `margin` | float | Expected margin at reference statewide D (lean + statewide - 0.50) |
-| `sigma_i` | float | District-level outcome noise (EB-shrunk) |
+| `sigma_i` | float | Independent district-level outcome noise (EB-shrunk) |
 | `win_prob` | float | P(D wins) at reference environment |
-| `marginal_wp` | float | dP(win)/d(lean) — "bang for buck": how much a small D lean improvement increases win probability. Highest near 50% WP (tossups), near zero for safe seats. Formula: φ(margin/σ_i)/σ_i |
+| `marginal_wp` | float | dP(win)/d(lean) — "bang for buck": how much a small D lean improvement increases win probability. Highest near 50% WP (tossups), near zero for safe seats. Formula: φ(margin/σ)/σ with σ = √(σ_i² + σ_shared²) |
 | `investment_rank` | int | Priority rank (1 = highest return) |
 | `tier` | str | District tier for reference |
 | `open_seat_2026` | bool | Open seat flag |
+
+---
+
+### `reports/session8/{office}_district_sigma.csv` — district outcome uncertainty
+
+Written by `session8` / `<office> simulate`; mirrored to `gui_data/{office}/district_sigma.csv`. Every win-probability consumer (`run_simulations`, `compute_analytical_win_probs`, `classify_districts`) raises if `sigma_shared` is missing, so a stale file fails loudly instead of producing overconfident numbers.
+
+| Column | Type | Description |
+|---|---|---|
+| `district` | int | District number |
+| `sigma_i` | float | Independent district noise: EB-shrunk blend of `swing_sd` and the within-year candidate-effect prior (`compute_sigma_prior`) |
+| `sigma_source` | str | `prior_only` or `shrunk_{n}pt` |
+| `sigma_shared` | float | Year-level shift shared by every district, drawn once per simulation (`compute_shared_sigma`). Same value on every row |
+| `sigma_total` | float | √(σ_i² + σ_shared²) — a district's marginal uncertainty at a known statewide environment |
 
 ---
 
@@ -751,7 +765,7 @@ vu[vu["district"].isin([31, 36])][["district","total_active_voters",
 ```python
 wp = pd.read_csv("reports/session8/oh_house_district_win_probs.csv")
 wp[wp["statewide_d_pct"] == 48.0].sort_values("win_prob", ascending=False).head(20)[
-    ["district","win_prob","sigma_i","sigma_source"]]
+    ["district","win_prob","sigma_total","sigma_i","sigma_source"]]  # win_prob uses sigma_total
 ```
 
 **22. Probabilistic scenario summary — how many seats at each statewide D?**
@@ -920,6 +934,7 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - **Pickup portfolio framing**: districts classified into Core (7 districts, >25% WP even at 46%), Stretch (5 districts, viable at 48%+), and Long-Shot (6 districts, only in a wave). Core portfolio: Districts 31, 36, 49, 52, 35, 64, 17. Three open seats (31, 52, 35) are highest-value opportunities.
 - **Key findings at 48% statewide D**: mean 39.9 seats [37–43 80% CI], P(≥40) = 57%, top investment targets by marginal WP: Districts 52, 39, 49, 36, 64.
 - **Validation**: σ_prior in expected range (0.046), monotonicity (0 violations), 2024 backtest (mean 32.8, 34 in 80% CI), tossup districts have highest marginal WP, seat std = 2.17.
+- **Superseded 2026-09-11** (see "Reference race and district-noise split" below): σ is now 2.98 pts independent + 2.35 pts shared (was 4.62 pooled, all independent). At 48%: mean 39.7 seats [33–46 80% CI], P(≥40) = 52%, seat std ≈ 5.0. Top investment targets at 48%: 52, 39, 17, 49, 60. Core portfolio: 31, 35, 36, 49, 52, 64.
 
 ### Session 10: Census Block Backbone Architecture ✅
 - New modules: `src/backbone.py`, `src/ingest_historical.py`; new CLI command: `python cli.py backbone`
@@ -949,12 +964,13 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - **Pre-2024 weights**: DEFAULT_WEIGHTS with 2024 keys removed; `build_composite()` redistributes proportionally. Effective weights: gov2022 29.4%, statewide_avg2022 17.6%, pre2020 17.6%, gov2018 17.6%, statewide_avg2018 11.8%, uss 2.9% each.
 - **Composite stability**: pre-2024 vs full composite correlation = 0.9996, mean |Δ lean| = 0.004, max = 0.013, 6 tier changes. The composite is highly stable without 2024 data.
 - **Binary accuracy**: 98.0% overall (97/99), 97.6% contested-only (81/83). Only 2 misclassifications: Districts 23 and 10 (both lean_d, predicted R, actually D — candidate overperformance).
-- **Competitive district accuracy**: 94.9% (37/39 in tossup/lean tiers).
+- **Competitive district accuracy**: the originally recorded 94.9% (37/39) does not reproduce — `backtest_summary.txt` reported 13/15 (86.7%) for contested tossup/lean districts. After the 2026-09-11 σ change: 11/12 (91.7%); the set shifts as tiers move, so treat it as a small-n diagnostic, not a headline.
 - **Seat count**: actual 34 D seats within MC 80% CI [30, 35] and 50% CI [31, 34]. MC mean = 32.5.
 - **Probabilistic quality**: Brier score 0.026 (all), Brier skill score 0.878 vs naive baseline. Spearman ρ = 0.970 (win_prob vs actual dem_share).
 - **Calibration**: model is slightly conservative in the 0.3–0.8 WP range (underpredicts D wins), consistent with D candidates outperforming fundamentals in some competitive districts.
 - Output: `reports/session12/backtest_summary.txt`, `reports/session12/backtest_district_predictions.csv`, `reports/session12/backtest_composite_comparison.csv`.
-- **Credibility claim**: the model would have correctly identified 37 of 39 competitive district outcomes using only pre-2024 data. The 2 misses were D candidates overperforming lean_d fundamentals — the kind of candidate effect a fundamentals-only model cannot predict in advance.
+- **Credibility framing**: lead with the probabilistic metrics (Brier skill, log loss, Spearman ρ), not binary accuracy — a naive "2022 winner's party holds" baseline scores 98.8% (86 districts with both years), higher than the model's 98.0%. The backtest is also conditional on the actual 2024 statewide result, so it tests the composite and district noise, not the environment forecast. The 2 misses were D candidates overperforming lean_d fundamentals — the kind of candidate effect a fundamentals-only model cannot predict in advance.
+- **Rerun 2026-09-11** (new reference race + σ split): Brier 0.0239 (was 0.0257), Brier skill 0.886, log loss 0.090 (was 0.097), Spearman ρ 0.978, E[seats] 32.3 vs. actual 34, 80% CI [25, 40] (was [30, 35]). The wider interval is intentional: it now carries the year-level shift. 2024's shift happened to be ≈0, so this one year can't identify σ_shared — don't tune it against the backtest.
 
 ### Session 13: Tier Terminology Overhaul ✅
 - **Problem**: tier labels (Lean D, Lean R, etc.) were based on composite lean thresholds (±3/8/15 pts), but in political jargon "Lean D" implies a projected outcome (~55% chance D wins). District 52 was labeled "Lean D" but predicted R at the 2024 statewide environment — confusing.
@@ -998,13 +1014,49 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - Senate PDFs flag districts on the 2026 ballot (odd-numbered districts only); congress PDFs omit that column since all 15 are up.
 - Per the plan ("Per-CD US House district profile PDFs for all 15. Build for the ~5 competitive ones; bulk-template the rest."), this is intentionally a single per-office summary, not 48 sparse individual district PDFs.
 
+### Reference race and district-noise split (2026-09-11)
+
+**Problem.** Two biases were pushing the forecast up and making district noise look bigger than it is:
+1. **Midterm reference race.** `year_baselines.json` used the governor as each midterm's "statewide D%". In 2022 Whaley (37.5%) ran 2.4–4.0 pts behind every down-ballot statewide race, and House Democrats beat her by 6.8 pts on average. That one-year gap went into the pooled candidate-effect σ as if it were district noise (4.62 pooled vs. 2.95 year-demeaned vs. 2.81 realized 2024 district scatter).
+2. **Senate polls as an environment reading.** Brown ran ahead of the rest of the D ticket in all three of his Ohio races (+1.6 in 2012, +5.7 in 2018, +3.8 in 2024, vs. the reference race). The blend treated that as symmetric ±2-pt noise, so a 53% Brown average read as a 53% environment. The premium is Brown's, not the office's: Fisher (2010, −4.8) and Strickland (2016, −6.7) ran well behind the ticket.
+
+**Changes.**
+- `src/composite.py`: `REFERENCE_MIDTERM_RACES` (AG/Aud/SOS/Treas), `reference_share()`, `compute_year_baselines()` (replaces three copy-pasted baseline loops in `cli.py`), `add_candidate_effects()`.
+- `src/simulate.py`: `compute_sigma_prior()` now returns the **within-year** pooled sd. New `compute_shared_sigma()` returns the between-year sd of the House's mean offset from the reference, net of each year's sampling noise: τ² = var(year means) − mean(σ_within²/n_year). `estimate_district_sigma(..., sigma_shared=...)` is keyword-required. `run_simulations` draws one shared shift per simulation. `compute_analytical_win_probs` and `classify_districts` use √(σ_i² + σ_shared²) (+ env σ). `shared_sigma_of()` raises on a sigma_df without the column.
+- `src/forecast_statewide.py`: `RACE_ADJUSTMENTS` / `race_deviation()` measure each race's deviation from the reference race in past cycles, using the block vote surfaces. The Senate uses Brown's three races: mean +3.7 subtracted, 2.3-pt predictive sd. The governor uses 2010–2022 (+3.3, −5.7, +0.4, −3.2): **no mean shift** (Acton has no record) but a 4.4-pt predictive sd. `CANDIDATE_IDIOSYNCRASY_SIGMA` is now only a floor. `forecast-trend` adds `governor_polls_raw_pct` / `senate_polls_raw_pct`.
+- House composite CSV candidate effects migrated in place. Recomputing them with the old baselines reproduced the existing columns exactly before the new ones were written. Senate/congress composites were rerun through the new code path; their effects shifted by exactly the baseline deltas.
+
+**Numbers (House unless noted).**
+
+| | Before | After |
+|---|---|---|
+| σ (district) | 4.62 pooled, independent | 2.98 independent + 2.35 shared |
+| At 48% fixed: mean / 80% CI / P(≥40) | 39.9 / [37, 43] / 57% | 39.7 / [33, 46] / 52% |
+| Blended environment (2026-09-11) | 50.0% | 48.2% |
+| Unconditional forecast: mean / 80% CI | 44.1 / [38, 50] | 39.8 / [32, 47] |
+| P(≥34) / P(≥40) / P(majority) | — / 84.1% / 12.7% | 85.4% / 51.7% / 5.3% |
+| Senate (unconditional) | — | 12.7 seats, P(≥9) 95.2%, P(majority) 10.0% |
+| Congress (unconditional) | — | 5.3 seats, P(≥5) 64.2%, P(≥6) 41.9% |
+
+"Before" figures come from outputs generated before this change. Separately, uncommitted edits to `src/ingest_polls.py` / `src/fundamentals.py` (effective-sample-size poll weighting, `question_id` grouping) landed during the same session; they are not part of this change. All "after" numbers use them. On their own they move the old-method blend only 50.1% → 50.0%. Blend variants at the same as-of date, with the same poll code: old method 50.0%, Senate adjustment only 48.7%, Senate + governor spread 48.2%. **The governor treatment is a judgment call.** Applying the measured 4.4-pt spread drops the governor signal's weight from 35% to 13% and moves weight to the generic ballot (44%) and adjusted Senate polls (39%). Reverting to the old governor treatment would mean letting the governor signal fall back to the 2-pt `CANDIDATE_IDIOSYNCRASY_SIGMA` floor instead of its measured spread; there is no switch for that yet.
+
+**Verified.** With `sigma_shared=0` and the old pooled σ, the new engine reproduces the old scenario table exactly. Analytic Σ win_prob (39.7) matches the MC mean (39.8). The CLI (`classify`, `session8`, `simulate`, `invest`, `win-prob`, `scenario`, `forecast`, `forecast-trend`, `backtest`, office variants), `report --all`, and the senate/congress office PDFs all run. All Streamlit pages except Pickup Portfolio pass `AppTest`; that page fails identically on the pre-change commit (pre-existing KeyError on `wp_46/48/50`).
+
+**Still open.**
+- τ (σ_shared) rests mostly on 2022 vs. 2024. The 2018/2020 means come from ~13 same-geography districts, and 2022's +3.6-pt House offset vs. the down-ballot reference drives most of it. Revisit after 2026.
+- `swing_sd` (raw D-share sd across years) still contains year-level shifts. It feeds σ_i for the 60 districts with ≥2 contested cycles. Small effect today (2022 and 2024 House environments were nearly identical), but conceptually it should be a residual sd.
+- `multi report` crashes on the House office summary (ReportLab LayoutError on the 99-row table). This predates the change; senate/congress reports run individually.
+- **The national fundamentals signal is now the largest blend weight (44%), and it sits on a presidential-anchored scale.** `OHIO_VS_NATIONAL_OFFSET_MEAN` (−5.63) comes from Ohio-vs-national *presidential* vote in 2020/2024, but it now feeds an estimate of the midterm down-ballot reference. Ohio's midterm reference moved from 47.7% (2018) to 40.7% (2022), so carrying the presidential offset over is an unvalidated assumption. Midterm national vote share is still uncollected (see Known gaps).
+- **Senate and congress σ_shared come from race history the repo already flags as unreliable.** Congress `years_reliable_for_race_history` is empty for every CD (new Oct 2025 map), and senate odd-district 2022 results are joined across maps by district number. `compute_shared_sigma` still reads their `candidate_effect_{year}` columns (senate τ = 2.57, congress τ = 1.38), so those forecasts' widths inherit that contamination.
+- **`reports/methodology.md` is the document meant for publication**, and it now misdescribes both the reference race and σ. Rewrite it before anything public. `reports/session8/README.md` and `reports/session5/methodology.md` also quote pre-change σ and seat numbers.
+
 ### Deferred: Natural Language Query Interface
 - Claude API integration — pushed back; unnecessary for current stakeholder needs.
 - May revisit if stakeholders need freeform querying beyond what the GUI provides.
 
 ## Polling Data (Phase B preliminary)
 
-Polling data was acquired ahead of Phase B (statewide forecast layer) but is not yet wired into any model run. Files live in `data/polls/`. All three raw-poll files (`governor.csv`, `senate.csv`, `approval_polls.csv`) share the same schema — the standard 538/ABC-style raw polls feed, which several outlets (including the NYT/Upshot poll tracker) source from or contribute to. `The New York Times/Siena University` shows up as one pollster among many within this feed, not as a separate source — "NYT polling" is already inside these files, not a distinct integration.
+Polling data feeds the Phase B statewide forecast through `python cli.py forecast` / `<office> forecast` / `forecast-trend` (see below); the GUI does not use it yet. Files live in `data/polls/`. All three raw-poll files (`governor.csv`, `senate.csv`, `approval_polls.csv`) share the same schema — the standard 538/ABC-style raw polls feed, which several outlets (including the NYT/Upshot poll tracker) source from or contribute to. `The New York Times/Siena University` shows up as one pollster among many within this feed, not as a separate source — "NYT polling" is already inside these files, not a distinct integration.
 
 Refreshed 2026-09-11 (previous `governor.csv` archived at `data/polls/archive/governor_2663rows_pre2026-09.csv`; confirmed the new pull is a strict superset by `poll_id` before replacing).
 
@@ -1073,9 +1125,9 @@ Verified: scalar-mode output is byte-identical to pre-change behavior (mean_seat
 1. **Look-ahead bias in `ingest_polls.weighted_average()`.** `recency_weight()`'s age calculation clips negative ages to 0, so a poll dated *after* `as_of` was being treated as maximally fresh instead of excluded — asking for `as_of=2026-06-01` was silently still pulling in every poll through September. Fixed: `weighted_average()` now filters `df = df[df["end_date"] <= as_of]` before computing any weights, and raises if that leaves nothing (per the "no synthetic data" convention — fail loudly, don't fabricate a point-in-time estimate from data that didn't exist yet).
 2. **NaN poisoning the blend when a race has only one poll.** `weighted_average()` correctly returns `NaN` for a single-poll's std (undefined, not zero) — but `_oh_race_signal()` was feeding that `NaN` straight into the precision-weighted blend, and `NaN` poisons a weighted sum: the entire `build_forecast()` output silently went `NaN`, which downstream became `mean_seats=0`. This is exactly the kind of early-cycle case `forecast-trend` exercises (only 1 OH governor/Senate poll existed in Feb–Apr 2025) that a "today only" workflow never would. Fixed: added `SINGLE_POLL_FALLBACK_SIGMA = 0.06` in `src/forecast_statewide.py` (matching this project's existing "insufficient data" convention, e.g. `compute_sigma_prior()`'s own 0.06 default) — used only when a race's own poll-spread is undefined.
 
-**Result, House, Feb 2025–present**: the blended environment has drifted from 44.0% D (Feb 2025) to 50.1% D (today) — a real ~6-point Democratic drift over the cycle, not noise.
+**Result, House, Feb 2025–present**: the blended environment has drifted from 43.5% D (Feb 2025) to 48.2% D (2026-09-11), after the Senate/governor race adjustments (44.0% → 50.1% before them) — a real ~5-point Democratic drift over the cycle, not noise.
 
-**Per-signal breakdown (2026-09-11)**: `forecast-trend`'s CSV also carries each individual component's own value at each date (`national_fundamentals_pct`, `governor_polls_pct`, `senate_polls_pct`, `historical_governor_pct` — the last one is a flat reference line since it's built from fixed past cycles, not live polls). Visualized as 4 lines on the artifact (national fundamentals, governor polls, senate polls, blended final) plus the historical baseline as a dashed flat reference — crosshair tooltip shows all values at once. This surfaced a real finding: governor and Senate polls **spiked together** in Feb–Mar 2026 while national fundamentals stayed flat, and by September Senate polls are running noticeably hotter (52.8% D) than governor polls (50.1%) and national fundamentals (47.7%) — worth investigating what drove the Feb–Mar spike before trusting it blindly.
+**Per-signal breakdown (2026-09-11)**: `forecast-trend`'s CSV also carries each individual component's own value at each date (`national_fundamentals_pct`, `governor_polls_pct`, `senate_polls_pct`, `historical_governor_pct` — the last one is a flat reference line since it's built from fixed past cycles, not live polls). Visualized as 4 lines on the artifact (national fundamentals, governor polls, senate polls, blended final) plus the historical baseline as a dashed flat reference — crosshair tooltip shows all values at once. This surfaced a real finding: governor and Senate polls **spiked together** in Feb–Mar 2026 while national fundamentals stayed flat, and by September Senate polls are running noticeably hotter (52.8% D) than governor polls (50.1%) and national fundamentals (47.7%) — worth investigating what drove the Feb–Mar spike before trusting it blindly. Since 2026-09-11, `senate_polls_pct` is the adjusted value used in the blend (raw − 3.7 pts, Brown's measured premium); `senate_polls_raw_pct` / `governor_polls_raw_pct` carry the unadjusted averages.
 
 ### Per-district detail at the blended environment (2026-09-11)
 
@@ -1085,32 +1137,34 @@ Verified: scalar-mode output is byte-identical to pre-change behavior (mean_seat
 
 **Verified**: analytic per-district win_prob matches the Monte Carlo `run_simulations(..., env_samples)` path within 0.64 pts max / 0.14 pts mean (House, 10,000 sims each way), and both sum to ≈44.14–44.16, matching the published mean_seats exactly (E[seats] = Σ P(win_i) holds). `cli.py invest` output confirmed byte-identical before/after this change (via `git stash`), so no existing consumer's ranking or CSV schema changed.
 
-**A framing trap worth flagging explicitly**: the count of districts with `win_prob > 0.5` (43 for House) is *not* the same number as the sum of win probabilities / expected seats (44.2) — they're usually close but not identical, and neither is a claim about which specific districts will flip. The CLI and the visualization both print/display both numbers side by side rather than picking one and implying it's "the" answer.
+**A framing trap worth flagging explicitly**: the count of districts with `win_prob > 0.5` (39 for House as of 2026-09-11) is *not* the same number as the sum of win probabilities / expected seats (39.7) — they're usually close but not identical, and neither is a claim about which specific districts will flip. The CLI and the visualization both print/display both numbers side by side rather than picking one and implying it's "the" answer.
 
 **Bug found and fixed 2026-09-11**: the first version of `{office}_forecast_district_detail.csv` reused targeting.csv's `tier` column as-is next to the freshly-computed `win_prob`/`margin_mean`. Those two things are computed at different reference environments — `tier` is a snapshot at the fixed 48% reference from Session 13, while `win_prob` here is computed at whatever the blended environment actually is (currently 50.1%). For districts whose fundamentals sit between those two points (District 60: `flip_threshold` 49.19%, squarely between 48% and 50.1%), this produced rows that looked self-contradictory — "Lean R" tier sitting next to a 57% Democratic win probability — even though every individual number was correct. Fixed: `tier` in this file is now computed fresh from the file's own `win_prob` via `classify.assign_tier_from_wp()` (the same WP_TIER_THRESHOLDS bucketing used everywhere else); the old 48%-reference tier is kept alongside as `tier_at_48` for comparison, since the shift itself is informative, not something to hide. 34 of 99 House districts shifted tier between the two reference points, all in the same (more Democratic) direction — consistent with the environment estimate itself moving from 48% to 50.1%, not evidence of a further bug. The visualization surfaces this shift directly in each district's detail panel when it applies.
 
 ### `src/forecast_statewide.py` — the final poll+fundamentals blend (2026-09-11)
 
-Combines four independent estimates of the shared latent "2026 Ohio generic partisan environment" via inverse-variance ("precision") weighting — `national_to_state.build_environment_prior()`, the direct OH governor polling average, the direct OH US Senate polling average, and `governor.py`'s historical 4-cycle baseline (included by default, `include_historical_governor_baseline=True`). Governor/Senate poll sigmas are inflated by `CANDIDATE_IDIOSYNCRASY_SIGMA` (0.02, a documented judgment call — see module docstring) before blending, since each race is a noisy, candidate-specific reading of the shared environment, not the environment itself.
+Combines four independent estimates of the shared latent "2026 Ohio generic partisan environment" via inverse-variance ("precision") weighting — `national_to_state.build_environment_prior()`, the direct OH governor polling average, the direct OH US Senate polling average, and `governor.py`'s historical 4-cycle baseline (included by default, `include_historical_governor_baseline=True`). Each race's poll average is first put on the reference scale using that race's measured deviation from the reference race in past Ohio cycles (`RACE_ADJUSTMENTS`, see "Reference race and district-noise split" above). Senate polls are shifted −3.7 pts (Brown's mean premium) with a 2.3-pt predictive sd. Governor polls get no shift but carry the 4.4-pt predictive sd of past governor-vs-reference gaps. `CANDIDATE_IDIOSYNCRASY_SIGMA` (0.02) is now only a floor under those measured spreads.
 
 As of 2026-09-11 (`build_forecast()`):
 
-| Signal | Mean D% | Sigma | N | Weight |
-|---|---|---|---|---|
-| national_fundamentals | 47.7% | 2.49 pts | 581 polls | 27.6% |
-| governor_polls | 50.1% | 2.20 pts | 19 polls | 35.5% |
-| senate_polls | 52.8% | 2.25 pts | 19 polls | 33.8% |
-| historical_governor | 42.2% | 7.46 pts | 4 cycles | 3.1% |
-| **BLENDED** | **50.1%** | **2.00 pts (floored)** | — | — |
+| Signal | Raw D% | Adj | Mean D% | Sigma | N | Weight |
+|---|---|---|---|---|---|---|
+| national_fundamentals | 47.4% | — | 47.4% | 2.41 pts | 581 polls | 43.9% |
+| governor_polls | 50.0% | 0 | 50.0% | 4.49 pts | 19 polls | 12.6% |
+| senate_polls | 53.0% | −3.7 | 49.3% | 2.56 pts | 19 polls | 38.9% |
+| historical_governor | 42.2% | — | 42.2% | 7.46 pts | 4 cycles | 4.6% |
+| **BLENDED** | | | **48.2%** | **2.00 pts (floored)** | — | — |
 
-**Sigma is floored at `MIN_OHIO_SIGMA` (0.02)** rather than using the naive precision-weighted combination (which came in at 1.31 pts). The naive combination treats all four signals as independent; they aren't fully independent — a systematic Ohio-wide polling bias this cycle would move the governor and Senate polling averages together, and that correlated-error component isn't modeled (full correlated multi-office posteriors are Phase C's job, not this pass's). The floor is a documented guard against the resulting overconfidence, not a fitted correction. Effect: flooring widened the Ohio House unconditional forecast from P(majority)=6.3% to a more defensible 12.7%, and the 80% seat CI from [40,49] to [38,50].
+Before the race adjustments, the same inputs blended to 50.0% (governor 34.7% weight, Senate 33.3% at 53.0%).
 
-Verified end-to-end: `build_forecast()`'s samples feed directly into `simulate.py::run_simulations()`'s new distribution mode with no adapter needed — unconditional Ohio House forecast using the blended environment: mean 44.1 seats, 80% CI [38, 50], P(≥40)=84.1%, P(majority)=12.7%.
+**Sigma is floored at `MIN_OHIO_SIGMA` (0.02)** rather than using the naive precision-weighted combination (1.60 pts after the race adjustments; 1.31 before). The floor covers error in estimating the statewide reference itself; the House's offset from the reference is a separate term (`simulate.compute_shared_sigma`). The naive combination treats all four signals as independent; they aren't fully independent — a systematic Ohio-wide polling bias this cycle would move the governor and Senate polling averages together, and that correlated-error component isn't modeled (full correlated multi-office posteriors are Phase C's job, not this pass's). The floor is a documented guard against the resulting overconfidence, not a fitted correction. Effect: flooring widened the Ohio House unconditional forecast from P(majority)=6.3% to a more defensible 12.7%, and the 80% seat CI from [40,49] to [38,50].
+
+Verified end-to-end: `build_forecast()`'s samples feed directly into `simulate.py::run_simulations()`'s distribution mode with no adapter needed. Unconditional Ohio House forecast as of 2026-09-11: mean 39.8 seats, 80% CI [32, 47], P(≥34)=85.4%, P(≥40)=51.7%, P(majority)=5.3% (before the reference-race and σ changes: 44.1, [38, 50], 84.1%, 12.7%).
 
 **Explicitly out of scope for this module** (see module docstring): a governor- or Senate-race-*specific* point forecast (e.g. "Acton's predicted vote share") — that would require separating each race's own idiosyncratic deviation from the shared environment used to estimate it, which isn't a clean thing to do without double-counting. This module only produces the shared generic-environment posterior that feeds down-ballot (House/State Senate/Congress) projections; `governor.py`'s own machinery is untouched.
 
 ### Known gaps
-- **No CLI command or GUI surface uses the Phase B forecast yet.** The full chain (`ingest_polls.py` → `fundamentals.py` → `national_to_state.py` → `forecast_statewide.py` → `simulate.py` distribution mode) works end-to-end when called from Python, but `cli.py` still only exposes the manual `--statewide-d` scalar workflow.
+- **The GUI doesn't use the Phase B forecast yet.** The CLI does (`forecast`, `<office> forecast`, `forecast-trend`); the dashboard still only exposes the manual statewide-D% slider.
 - **No pre-2025 national generic-ballot or approval time series exists in the repo.** A self-calibrated "national environment → Ohio environment" regression (the roadmap's originally-stated MVP approach) can't be fit from Ohio's own history without it — `OHIO_VS_NATIONAL_OFFSET_MEAN` is a 2-point cited reference instead, not a fit coefficient. No historical backtest of `national_to_state.py` is possible until this is acquired.
 - **No state-level polling for State Senate, State House, or US House races**. Forecast for those offices is fundamentals-only by necessity (`national_to_state.py`'s translated environment + composite-lean projection). Be transparent about this in the public methodology.
 - **Approval data is Trump-only** — no Biden retrospective averages in either approval file. Adequate for current cycle, but limits historical calibration, and approval is now a secondary/fallback signal rather than primary (see above).
@@ -1128,6 +1182,8 @@ Verified end-to-end: `build_forecast()`'s samples feed directly into `simulate.p
 - Precinct boundaries shift between elections. Each year needs its own geometry; crosswalking across years requires either VEST shapefiles for that year or a precinct-to-block assignment from the voter file.
 - Composite weights are analyst judgments, not empirically optimized. Session 4 regression can inform weight calibration.
 - Uncontested races (~30-40% of Ohio House seats in a typical cycle) are information voids for candidate effect estimation.
+- The shared year-level σ (`compute_shared_sigma`, 2.35 pts for the House) is estimated from four cycles, and effectively from 2022 vs. 2024. It widens every published interval; treat it as provisional until 2026 results are in.
+- `swing_sd` is the raw sd of House D share across years, so it still contains year-level shifts. It feeds σ_i via EB shrinkage.
 
 ### Voter file limitations (Session 8)
 

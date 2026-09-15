@@ -150,7 +150,9 @@ def compute_wp_at_environment(
 ) -> pd.Series:
     """Compute analytical D win probability at a given statewide environment.
 
-    P(D wins) = Φ((statewide_d + lean - 0.50) / sigma_i)
+    P(D wins) = Φ((statewide_d + lean - 0.50) / sigma), where sigma is the
+    district's total uncertainty at a known environment (sigma_total from
+    simulate.estimate_district_sigma: independent + shared parts).
     """
     margin = statewide_d + composite_lean - 0.50
     return pd.Series(norm.cdf(margin / sigma_i), index=composite_lean.index)
@@ -180,13 +182,16 @@ def classify_districts(
 
     if sigma_df is not None:
         # WP-based tiers at each reference environment
+        from src.simulate import shared_sigma_of
+
         merged = df[["district", "composite_lean"]].merge(
             sigma_df[["district", "sigma_i"]], on="district", how="left",
         )
+        total_sigma = np.sqrt(merged["sigma_i"] ** 2 + shared_sigma_of(sigma_df) ** 2)
         for env in REFERENCE_ENVIRONMENTS:
             env_label = f"{int(env * 100)}"
             wp = compute_wp_at_environment(
-                merged["composite_lean"], merged["sigma_i"], env,
+                merged["composite_lean"], total_sigma, env,
             )
             df[f"wp_{env_label}"] = wp.values
             df[f"tier_{env_label}"] = wp.apply(assign_tier_from_wp).values

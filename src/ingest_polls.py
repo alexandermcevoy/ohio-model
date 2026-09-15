@@ -23,6 +23,23 @@ POLLS = REPO_ROOT / "data" / "polls"
 # but aren't a vote for either party).
 NON_CANDIDATE_ANSWERS = {"Don't know", "Someone else", "Would not vote"}
 
+# Ceiling on a single poll's effective N, expressed as a multiple of the
+# median effective N among the polls being combined in one weighted_average()
+# call. Without this, a high-frequency large-panel tracker can numerically
+# swallow the entire blend: confirmed on data/polls/generic_ballot.csv that
+# Morning Consult (median ~25,500-respondent completes, 119 of 581 polls in
+# that file, vs. ~1,000-2,000 for a typical pollster) would otherwise receive
+# ~79% of the total weight on raw effective-N alone — turning an aggregate of
+# 40+ pollsters into essentially one house's number. Real-world large online
+# panels carry design effects that make their true information content far
+# below their raw completed-interview count, which is the standard reason
+# aggregators cap this rather than weight by raw N linearly. 3.0 is a
+# judgment call, not a fitted value: generous enough that a genuinely large,
+# well-conducted poll still outweighs a small one, tight enough that no
+# single poll (or house running many similar-sized polls) can dominate a
+# blend of dozens.
+MAX_EFFECTIVE_N_MULTIPLE = 3.0
+
 
 def load_polls(
     path: Path | str,
@@ -74,10 +91,23 @@ def two_party_share(
     matters materially: an OH governor poll reads Acton 46.67 / Ramaswamy
     46.85 on the topline (6.06% "don't know" absorbs the rest), which is
     49.9% two-party D, not 46.7%.
+
+    Grouped by (poll_id, question_id) rather than poll_id alone: a single
+    poll can test several hypothetical matchups as separate questions (e.g.
+    an OH governor poll pairing Acton against Ramaswamy in one question and
+    against a different Republican in another). Pivoting on poll_id alone
+    would pick whichever row for each candidate name came first in the
+    dataframe, which can silently pair the dem's answer to one question with
+    the rep's answer from a different one. Grouping by question_id first
+    keeps each matchup's two numbers together; if a poll asks about the same
+    dem-vs-rep pairing in more than one question (repeat/tracking questions
+    within one field period), those question-level shares are averaged into
+    one poll-level row rather than arbitrarily taking the first.
     """
     sub = df[df["candidate_name"].isin([dem_name, rep_name])]
+    group_cols = ["poll_id", "question_id"] if "question_id" in sub.columns else ["poll_id"]
     piv = sub.pivot_table(
-        index="poll_id", columns="candidate_name", values="pct", aggfunc="first"
+        index=group_cols, columns="candidate_name", values="pct", aggfunc="first"
     )
     piv = piv.dropna(subset=[dem_name, rep_name])
 
@@ -88,6 +118,19 @@ def two_party_share(
 
     result = piv.rename(columns={dem_name: "dem_pct", rep_name: "rep_pct"}).reset_index()
     result["dem_two_party"] = result["dem_pct"] / (result["dem_pct"] + result["rep_pct"])
+
+    if "question_id" in result.columns:
+        result = result.groupby("poll_id", as_index=False).agg(
+            {"dem_pct": "mean", "rep_pct": "mean", "dem_two_party": "mean"}
+        )
+
+    # Fraction of the topline that actually landed on the dem or the rep —
+    # the complement is "don't know" / "someone else" / third-party
+    # candidates. Feeds weighted_average()'s effective-sample-size weighting:
+    # a poll with a lot of undecided respondents has fewer of them actually
+    # backing its reported dem/rep ratio than the headline sample size
+    # implies.
+    result["decided_frac"] = (result["dem_pct"] + result["rep_pct"]) / 100.0
 
     meta_cols = [
         c
@@ -145,6 +188,65 @@ def quality_weight(df: pd.DataFrame, partisan_discount: float = 0.5) -> pd.Serie
     return grade_weight * discount
 
 
+def effective_n_weight(
+    df: pd.DataFrame,
+    value_col: str,
+    n_col: str = "sample_size",
+    decided_frac_col: str = "decided_frac",
+) -> pd.Series:
+    """
+    Inverse-variance weight from each poll's own sampling error, treating its
+    reported share as estimated only from respondents who landed on one of
+    the two named outcomes — not from the full headline sample size.
+
+    A poll's `value_col` (e.g. two-party D share) is a ratio among decided
+    respondents. When a large share picked "don't know," a third-party
+    candidate, or (for approval polls) "no opinion," the headline sample
+    size overstates how many respondents actually back that ratio. Effective
+    N = sample_size * decided_frac; standard binomial SE on that effective N
+    gives each poll's own variance, and weight = 1/variance (normalized to
+    have mean 1 across the polls being combined, so it composes with
+    `recency_weight`/`quality_weight` without changing their overall scale).
+
+    This also means, as a side effect, that raw sample size now matters at
+    all — previously two polls got equal weight regardless of N=400 vs
+    N=1500. That wasn't a deliberate prior choice, just something the old
+    recency x quality weighting never accounted for.
+
+    Falls back to uniform weight (1.0) when `n_col` or `decided_frac_col`
+    isn't present, so callers that don't provide sample size or a decided
+    fraction are unaffected.
+    """
+    if n_col not in df.columns or decided_frac_col not in df.columns:
+        return pd.Series(1.0, index=df.index)
+
+    n = pd.to_numeric(df[n_col], errors="coerce")
+    decided_frac = df[decided_frac_col].clip(lower=0.05, upper=1.0)
+    effective_n = n * decided_frac
+
+    # Cap before computing variance, not after computing weight — see
+    # MAX_EFFECTIVE_N_MULTIPLE docstring. Median is over this same call's
+    # poll set (post as_of filtering), so the cap tracks whatever's actually
+    # being combined rather than a fixed global constant.
+    median_n = effective_n.median()
+    if pd.notna(median_n) and median_n > 0:
+        effective_n = effective_n.clip(upper=median_n * MAX_EFFECTIVE_N_MULTIPLE)
+
+    p = df[value_col].clip(lower=0.05, upper=0.95)
+    variance = p * (1 - p) / effective_n
+
+    raw_weight = 1.0 / variance
+    if not np.isfinite(raw_weight.to_numpy()).any():
+        return pd.Series(1.0, index=df.index)
+
+    raw_weight = raw_weight.fillna(raw_weight.median())
+    mean_weight = raw_weight.mean()
+    if not np.isfinite(mean_weight) or mean_weight <= 0:
+        return pd.Series(1.0, index=df.index)
+
+    return raw_weight / mean_weight
+
+
 def weighted_average(
     df: pd.DataFrame,
     value_col: str,
@@ -153,7 +255,8 @@ def weighted_average(
     partisan_discount: float = 0.5,
 ) -> tuple[float, float, int]:
     """
-    Recency- and quality-weighted mean + weighted std + poll count.
+    Recency-, quality-, and effective-sample-size-weighted mean + weighted
+    std + poll count.
 
     Returns (weighted_mean, weighted_std, n_polls). std is NaN when only one
     poll is present (undefined, not zero — a single poll doesn't mean zero
@@ -180,7 +283,8 @@ def weighted_average(
 
     w_recency = recency_weight(df["end_date"], as_of, half_life_days)
     w_quality = quality_weight(df, partisan_discount)
-    weights = (w_recency * w_quality).to_numpy()
+    w_precision = effective_n_weight(df, value_col)
+    weights = (w_recency * w_quality * w_precision).to_numpy()
 
     if weights.sum() <= 0:
         weights = np.ones(len(df))

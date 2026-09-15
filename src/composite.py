@@ -38,6 +38,75 @@ STATEWIDE_AVG_INPUTS: dict[str, list[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Reference statewide race ("the statewide environment") per cycle
+# ---------------------------------------------------------------------------
+
+REFERENCE_MIDTERM_RACES: tuple[str, ...] = ("atg", "aud", "sos_off", "tre")
+"""
+Races averaged (unweighted mean of two-party D shares) to form the reference
+statewide D share in a midterm year. Presidential years use the presidential
+race alone. Same four races as the composite's `statewide_avg`.
+
+The reference share is what "statewide D%" means everywhere downstream:
+year_baselines.json, candidate effects, anomaly residuals, the simulation's
+`statewide_d`, and the race-to-environment adjustments in
+src/forecast_statewide.py.
+
+Midterms used the governor race until Sept 2026. It was replaced because the
+governor is the most candidate-driven race on a midterm ballot and drifts
+far from the rest of the ticket: in 2022 Whaley (37.5%) ran 2.4-4.0 pts
+behind every down-ballot executive race, and contested House Democrats beat
+her by 6.8 pts on average. That one year's gap was being counted as
+district-level noise (see simulate.compute_sigma_prior).
+"""
+
+
+def reference_share(race_shares: dict[str, float], year: int | str) -> float:
+    """
+    Reference statewide two-party D share for one cycle.
+
+    `race_shares` maps short race label ('pre', 'atg', ...) to that race's
+    statewide two-party D share. Presidential years return 'pre'; midterms
+    return the mean of whichever REFERENCE_MIDTERM_RACES are present.
+    """
+    year = int(year)
+    if year % 4 == 0:
+        if "pre" not in race_shares:
+            raise KeyError(f"No presidential race available for reference share in {year}")
+        return float(race_shares["pre"])
+    vals = [race_shares[r] for r in REFERENCE_MIDTERM_RACES if r in race_shares]
+    if not vals:
+        raise KeyError(
+            f"None of {REFERENCE_MIDTERM_RACES} available for reference share in {year}"
+        )
+    return float(sum(vals) / len(vals))
+
+
+def compute_year_baselines(sos_files: dict) -> dict[str, float]:
+    """
+    Reference statewide two-party D share for each loaded SOS year.
+
+    `sos_files` maps year string -> SosFile (src.ingest_sos). Years lacking
+    every reference race are skipped, not guessed.
+    """
+    from src.ingest_sos import get_race_df
+
+    baselines: dict[str, float] = {}
+    for year, sos in sos_files.items():
+        races = ("pre",) if int(year) % 4 == 0 else REFERENCE_MIDTERM_RACES
+        shares: dict[str, float] = {}
+        for race in races:
+            if race in sos.statewide:
+                rd = get_race_df(sos, race)
+                d, r = float(rd["d_votes"].sum()), float(rd["r_votes"].sum())
+                if d + r > 0:
+                    shares[race] = d / (d + r)
+        if shares:
+            baselines[str(year)] = reference_share(shares, year)
+    return baselines
+
+
 def compute_statewide_avg_lean(
     district_leans: dict[tuple[str, str], pd.Series],
     year: str,
@@ -179,36 +248,47 @@ def merge_composite_with_house_results(
     Parameters
     ----------
     year_baselines : {year: statewide_dem_two_party_share} for the reference
-        statewide race each cycle (presidential for 2020/2024, gubernatorial
-        for 2018/2022). If None or missing for a year, effect is left as NaN.
+        statewide race each cycle (see compute_year_baselines). If None or
+        missing for a year, effect is left as NaN.
     """
     merged = composite_df.copy()
     if not house_wide.empty:
         merged = merged.merge(house_wide, on="district", how="left")
 
-    if year_baselines is None:
-        year_baselines = {}
+    merged = add_candidate_effects(merged, available_years, year_baselines or {})
+    return merged.sort_values("composite_lean", ascending=False).reset_index(drop=True)
 
+
+def add_candidate_effects(
+    df: pd.DataFrame,
+    available_years: list[str],
+    year_baselines: dict[str, float],
+) -> pd.DataFrame:
+    """
+    (Re)write candidate_effect_{year} = dem_share_{year} - (baseline + composite_lean)
+    for contested district-years. Uncontested rows and years without a
+    baseline are NaN.
+    """
+    df = df.copy()
     for year in available_years:
         share_col = f"dem_share_{year}"
         contested_col = f"contested_{year}"
         effect_col = f"candidate_effect_{year}"
         baseline = year_baselines.get(year)
 
-        if share_col not in merged.columns or contested_col not in merged.columns:
+        if share_col not in df.columns or contested_col not in df.columns:
             continue
 
-        merged[effect_col] = float("nan")
+        df[effect_col] = float("nan")
         if baseline is None:
             continue
 
-        contested_mask = merged[contested_col].fillna(False)
-        expected = baseline + merged["composite_lean"]
-        merged.loc[contested_mask, effect_col] = (
-            merged.loc[contested_mask, share_col] - expected.loc[contested_mask]
+        contested_mask = df[contested_col].fillna(False).astype(bool)
+        expected = baseline + df["composite_lean"]
+        df.loc[contested_mask, effect_col] = (
+            df.loc[contested_mask, share_col] - expected.loc[contested_mask]
         )
-
-    return merged.sort_values("composite_lean", ascending=False).reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------------------

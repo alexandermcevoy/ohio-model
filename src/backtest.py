@@ -37,6 +37,7 @@ from src.ingest_race_results import (
 from src.simulate import (
     SimConfig,
     compute_sigma_prior,
+    compute_shared_sigma,
     estimate_district_sigma,
     compute_analytical_win_probs,
     run_simulations,
@@ -134,10 +135,14 @@ def run_backtest_for_office(office) -> dict:
     )
 
     sigma_prior = compute_sigma_prior(composite_with_effects)
-    print(f"  Sigma prior: {sigma_prior:.4f}")
+    print(f"  Sigma prior (within-year): {sigma_prior:.4f}  |  shared year sigma: "
+          f"{compute_shared_sigma(composite_with_effects):.4f}")
 
     _scratch = compute_swing_metrics(composite_pre.copy(), pre_long)
-    sigma_df = estimate_district_sigma(_scratch, sigma_prior)
+    sigma_df = estimate_district_sigma(
+        _scratch, sigma_prior,
+        sigma_shared=compute_shared_sigma(composite_with_effects),
+    )
 
     # Targeting-like DF.
     winners = actual_2024[["district", "winner"]].rename(columns={"winner": "winner_2024"})
@@ -384,11 +389,15 @@ def run_backtest() -> dict:
 
     # Estimate district uncertainty from pre-2024 data
     sigma_prior = compute_sigma_prior(composite_with_effects)
-    print(f"  Sigma prior (pre-2024 candidate effects): {sigma_prior:.4f}")
+    print(f"  Sigma prior (pre-2024, within-year): {sigma_prior:.4f}  |  shared year sigma: "
+          f"{compute_shared_sigma(composite_with_effects):.4f}")
 
     # Need swing metrics for sigma estimation — compute on a scratch copy first
     _scratch = compute_swing_metrics(composite_pre.copy(), house_pre)
-    sigma_df = estimate_district_sigma(_scratch, sigma_prior)
+    sigma_df = estimate_district_sigma(
+        _scratch, sigma_prior,
+        sigma_shared=compute_shared_sigma(composite_with_effects),
+    )
     print(f"  Sigma range: {sigma_df['sigma_i'].min():.4f} - "
           f"{sigma_df['sigma_i'].max():.4f}")
 
