@@ -56,19 +56,48 @@ from src.fundamentals import (
 #         74,223,975, two-party share)                          -> -6.35 pts
 #   2024: Ohio 44.34%  vs. national 49.25% (Harris 75,017,613 / Trump
 #         77,302,580, two-party share)                          -> -4.91 pts
-# Two data points only, mean -5.63 pts. This is NOT a regression — it's a
-# small, documented reference range in the same spirit as
-# LITERATURE_INCUMBENCY_ADVANTAGE (src/constants.py): a point estimate with
-# deliberately wide uncertainty, to be replaced once more cycles or a real
-# backtest exist. Midterm-year (non-presidential) national vote share is a
-# different, not-yet-collected number — see CLAUDE.md Known Limitations.
-OHIO_VS_NATIONAL_OFFSET_MEAN: float = -0.0563
-OHIO_VS_NATIONAL_OFFSET_SIGMA: float = 0.02
+# Two data points, mean -5.63 pts. Kept for reference only — every current
+# caller of translate_national_to_ohio() (governor, US Senate, State House,
+# State Senate, US House, all 2026) is a MIDTERM cycle, so this presidential
+# figure was always the wrong-flavor prior for what it was being used for;
+# it was the only data available until the midterm figure below existed.
+OHIO_VS_NATIONAL_OFFSET_PRESIDENTIAL_MEAN: float = -0.0563
+OHIO_VS_NATIONAL_OFFSET_PRESIDENTIAL_SIGMA: float = 0.02
+
+# Ohio's own midterm reference-race D share (AG/Auditor/SOS/Treasurer mean —
+# src.composite.REFERENCE_MIDTERM_RACES, src.composite.reference_share()) vs.
+# the certified national U.S. House two-party popular vote, each midterm
+# cycle. Ohio shares read from data/processed/block_votes_{year}.parquet
+# (Session 10 block backbone — already ingested, not newly collected).
+# National shares are certified House vote totals (public record):
+#   2010: Ohio 45.68% vs. national 46.51% (D 38,980,192 / R 44,829,751)  -> -0.83 pts
+#   2014: Ohio 39.83% vs. national 47.06% (D 35,624,357 / R 40,081,282)  -> -7.23 pts
+#   2018: Ohio 47.71% vs. national 54.36% (D 60,572,245 / R 50,861,970)  -> -6.65 pts
+#   2022: Ohio 40.68% vs. national 48.60% (D 51,280,463 / R 54,227,992)  -> -7.92 pts
+# n=4, mean -5.66 pts, sample std 3.26 pts (statistics.stdev, n-1). The mean
+# lands almost exactly on the old presidential-only figure (-5.63 vs -5.66)
+# — the point estimate wasn't wrong — but the true spread is far wider than
+# the 2-pt padding previously assumed: 2010 (a nationalized wave election)
+# shows almost no Ohio/national gap at all, while 2014/2018/2022 all show
+# Ohio running 6.6-7.9 pts more Republican than the national environment.
+# A single national environment reading translates to a much less certain
+# Ohio number than the old sigma implied. Still only 4 points — not a fit,
+# still a documented judgment call — but a measured one instead of an
+# assumed one.
+OHIO_VS_NATIONAL_OFFSET_MIDTERM_MEAN: float = -0.0566
+OHIO_VS_NATIONAL_OFFSET_MIDTERM_SIGMA: float = 0.0326
+
+# Used by translate_national_to_ohio() — every current caller is a midterm
+# cycle (see above), so this is the one actually applied on the live path.
+OHIO_VS_NATIONAL_OFFSET_MEAN: float = OHIO_VS_NATIONAL_OFFSET_MIDTERM_MEAN
+OHIO_VS_NATIONAL_OFFSET_SIGMA: float = OHIO_VS_NATIONAL_OFFSET_MIDTERM_SIGMA
 OHIO_VS_NATIONAL_OFFSET_SOURCE: str = (
-    "Ohio two-party presidential share (data/processed/year_baselines.json, "
-    "2020 & 2024) vs. certified national two-party popular vote share the "
-    "same cycles (-6.35 and -4.91 pts). Two data points only — treat as a "
-    "wide prior, not a fit coefficient."
+    "Ohio midterm reference-race two-party share (AG/Auditor/SOS/Treasurer "
+    "mean, from data/processed/block_votes_{year}.parquet) vs. certified "
+    "national U.S. House two-party popular vote, 2010/2014/2018/2022 "
+    "(-0.83, -7.23, -6.65, -7.92 pts). Four data points — a measured "
+    "spread, not a fit coefficient. See OHIO_VS_NATIONAL_OFFSET_PRESIDENTIAL_* "
+    "for the (very similar-mean, much narrower-sigma) presidential-cycle figure."
 )
 
 
@@ -98,7 +127,9 @@ def translate_national_to_ohio(
     Apply the Ohio-vs-national offset to a national environment estimate.
 
     Widens sigma in quadrature by OHIO_VS_NATIONAL_OFFSET_SIGMA to reflect
-    that the offset itself is estimated from only two cycles, not fit.
+    that the offset itself is a measured spread across four midterm cycles
+    (2010/2014/2018/2022), not a fit — see OHIO_VS_NATIONAL_OFFSET_MIDTERM_*
+    above for the derivation.
     """
     ohio_value = national_value + OHIO_VS_NATIONAL_OFFSET_MEAN
     ohio_sigma = float(np.sqrt(national_sigma**2 + OHIO_VS_NATIONAL_OFFSET_SIGMA**2))
