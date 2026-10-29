@@ -1076,6 +1076,18 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - **Prior date**: `prior_as_of()` = min(today, `ELECTION_DAY` 2026-11-03), so the prior doesn't shift at midnight during the count.
 - **Verified 2026-10-29**: (1) every race final → seat std 0 in each chamber, mean = entered D winners + fixed D. (2) False-call stress test, 30 trials per scenario, truths drawn from the prior, every race at 10–40% reporting: wrong ≥99% calls among races not already ≥99% pre-election were 0.22% (true skew 0), 0.00% (+10 pts), 0.75% (+10, half the races reporting), 0.35% (−10), 0.48% (+10 with 1.5× geographic noise). Under 1% in every case, so `TAU_SCALE`/`CALL_THRESHOLD` were left as is. Small n; a diagnostic, not a calibration.
 
+### Headline numbers: Polling Average + Win Likelihood (2026-10-29)
+
+The blended environment (`build_forecast().ohio_value`) is no longer shown as a headline anywhere. It's the Democratic two-party share of a *generic* statewide race (the average of AG/Auditor/SOS/Treasurer, no candidates attached): every projection is built on it, but it is neither a real race's vote share nor a probability. It stays in the model, in `forecast-trend` CSVs and in `reports/election_night/history.csv`.
+
+- `src/headlines.py::statewide_headlines()` is the single source for both numbers; `forecast`, `election-night`, the Election Night page and the published forecast page all call it.
+  - **Polling Average**: raw candidate toplines with the model's exact poll weights (`ingest_polls.poll_weights`, factored out of `weighted_average`). Never the Brown-adjusted Senate value. Shown with an **80% range on the margin**: √(poll spread² + `STATEWIDE_POLL_ERROR_SD`²) on two-party share, doubled for a margin and scaled by the decided share. Poll spread is the weighted sd of the polls' two-party shares (the model's own poll-uncertainty convention); the polling-miss term is the same 3 pts the Win Likelihood assumes, so the two are consistent. As of 10/29: Governor Ramaswamy +5 to Acton +12 (spread 1.9 pts, total 3.5), Senate Husted +4 to Brown +12 (spread 1.2, total 3.2). Most of the width is the polling-miss term.
+  - **Win Likelihood**: P(D wins) from `src/election_night.py`. With no `result` passed it runs the pre-election prior with explicit empty returns, so `forecast` never shows a live posterior.
+- Chambers keep Expected Seats; their Win Likelihood is P(majority) (House, Senate) or P(hold 5) (US House). There is no chamber "polling average": no Ohio legislative polling exists, and the national generic ballot isn't one.
+- `forecast --details` / `election-night --details` print the old environment blend; the Election Night page has a collapsed "Model internals" expander. The Scenario Explorer's "Statewide D Environment" slider is the same quantity as a manual input and is unchanged.
+- As of 2026-10-29: Governor Acton 48.8 / Ramaswamy 45.5 (Acton +3.3), win likelihood Acton 64%. Senate Brown 48.3 / Husted 44.2 (Brown +4.1), Brown 75%. These depend directly on `STATEWIDE_POLL_ERROR_SD` (3 pts, mean 0).
+- Published page: https://claude.ai/artifact/SgzK1Zii9DVBGkNTB48TRw (v13, rebuilt from the 10/29 forecast outputs; the environment-signal section and the blended number were removed).
+
 ### Deferred: Natural Language Query Interface
 - Claude API integration — pushed back; unnecessary for current stakeholder needs.
 - May revisit if stakeholders need freeform querying beyond what the GUI provides.

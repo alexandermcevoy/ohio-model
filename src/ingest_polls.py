@@ -247,6 +247,38 @@ def effective_n_weight(
     return raw_weight / mean_weight
 
 
+def poll_weights(
+    df: pd.DataFrame,
+    value_col: str,
+    as_of: pd.Timestamp | None = None,
+    half_life_days: float = 21.0,
+    partisan_discount: float = 0.5,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    The polls weighted_average() uses (end_date <= as_of) and their weights,
+    so other averages over the same polls (e.g. raw candidate toplines) can
+    reuse exactly the same weighting.
+    """
+    if df.empty:
+        raise ValueError("weighted_average called on an empty DataFrame")
+
+    if as_of is None:
+        as_of = pd.Timestamp.now().normalize()
+
+    df = df[df["end_date"] <= as_of]
+    if df.empty:
+        raise ValueError(f"No polls with end_date <= {as_of.date()} — cannot compute a point-in-time average")
+
+    w_recency = recency_weight(df["end_date"], as_of, half_life_days)
+    w_quality = quality_weight(df, partisan_discount)
+    w_precision = effective_n_weight(df, value_col)
+    weights = (w_recency * w_quality * w_precision).to_numpy()
+
+    if weights.sum() <= 0:
+        weights = np.ones(len(df))
+    return df, weights
+
+
 def weighted_average(
     df: pd.DataFrame,
     value_col: str,
@@ -271,24 +303,7 @@ def weighted_average(
     date. Confirmed this actually bit — before this fix, asking for
     `as_of=2026-06-01` still pulled in every poll through September.
     """
-    if df.empty:
-        raise ValueError("weighted_average called on an empty DataFrame")
-
-    if as_of is None:
-        as_of = pd.Timestamp.now().normalize()
-
-    df = df[df["end_date"] <= as_of]
-    if df.empty:
-        raise ValueError(f"No polls with end_date <= {as_of.date()} — cannot compute a point-in-time average")
-
-    w_recency = recency_weight(df["end_date"], as_of, half_life_days)
-    w_quality = quality_weight(df, partisan_discount)
-    w_precision = effective_n_weight(df, value_col)
-    weights = (w_recency * w_quality * w_precision).to_numpy()
-
-    if weights.sum() <= 0:
-        weights = np.ones(len(df))
-
+    df, weights = poll_weights(df, value_col, as_of, half_life_days, partisan_discount)
     values = df[value_col].to_numpy()
     mean = float(np.average(values, weights=weights))
 

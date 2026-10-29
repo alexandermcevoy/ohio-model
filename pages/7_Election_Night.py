@@ -16,6 +16,7 @@ import streamlit as st
 
 from gui.styles import HOLDER_COLORS, fmt_pct
 from src import election_night as en
+from src.headlines import statewide_headlines
 from src.office import get_office
 
 st.set_page_config(page_title="Election Night", page_icon=":ballot_box:", layout="wide")
@@ -139,28 +140,39 @@ if st.session_state.pop("en_saved", False):
 races = result.races
 
 with projection:
-    st.caption(f"As of {result.as_of:%H:%M:%S} · {result.n_observations} race(s) with returns entered")
+    st.caption(f"As of {result.as_of:%H:%M:%S} · {result.n_observations} race(s) with returns entered · "
+               f"{int(races['is_final'].sum())} fully counted")
     for w in result.warnings:
         st.warning(w)
 
-    e, e_sd = result.environment
-    e0, _ = result.environment_prior
-    s, s_sd = result.skew
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Environment (reference race)", f"{e:.1%}", f"±{e_sd * 100:.1f} · {(e - e0) * 100:+.1f} pts vs. pre-election", delta_color="off")
-    c2.metric("Early-count skew", f"{s * 100:+.1f} pts", f"±{s_sd * 100:.1f} pts", delta_color="off")
-    c3.metric("Races fully counted", int(races["is_final"].sum()))
-
     st.subheader("Statewide races")
-    sw = races[races["office"] == "statewide"]
+    st.caption("Polling average = weighted raw poll toplines; its 80% range is where the final margin lands 4 times "
+               "in 5 if polls miss like they typically do. Win likelihood = chance each candidate wins, "
+               "updated live as returns are entered.")
     cols = st.columns(3) + st.columns(3)
-    for col, r in zip(cols, sw.itertuples()):
-        col.metric(r.label, f"D {r.proj_d_share:.1%}", r.call, delta_color="off")
-        col.progress(float(r.win_prob), text=f"P(D) {r.win_prob:.0%}")
-        if pd.notna(r.live_d_share):
-            frac = "final" if r.is_final else (f"{r.live_fraction:.0%} in" if pd.notna(r.live_fraction) else "")
-            col.caption(f"Live D {r.live_d_share:.1%} · {frac}")
-    st.caption("Row offices have no polling or candidate data: their projection is the environment alone.")
+    for col, h in zip(cols, statewide_headlines(result)):
+        d_name = (h.dem_name or "Democrat").split()[-1]
+        r_name = (h.rep_name or "Republican").split()[-1]
+        leader, p = (d_name, h.win_likelihood) if h.win_likelihood >= 0.5 else (r_name, 1 - h.win_likelihood)
+        col.metric(h.label, f"{leader} {p:.0%}", h.call, delta_color="off", help="Win likelihood")
+        col.progress(float(h.win_likelihood), text=f"{d_name} {h.win_likelihood:.0%} · {r_name} {1 - h.win_likelihood:.0%}")
+        col.caption("Polling average: " + (f"{h.polling.describe()} · {h.polling.band_text()}" if h.polling else "no public polls"))
+        if h.live_d_share is not None:
+            frac = "final" if h.is_final else ("" if h.live_fraction is None else f"{h.live_fraction:.0%} in")
+            col.caption(f"Live: {d_name} {h.live_d_share:.1%} of the two-party vote · {frac}")
+
+    with st.expander("Model internals"):
+        e, e_sd = result.environment
+        e0, _ = result.environment_prior
+        s, s_sd = result.skew
+        c1, c2 = st.columns(2)
+        c1.metric("Environment (generic statewide race)", f"{e:.1%}",
+                  f"±{e_sd * 100:.1f} · {(e - e0) * 100:+.1f} pts vs. pre-election", delta_color="off")
+        c2.metric("Early-count skew", f"{s * 100:+.1f} pts", f"±{s_sd * 100:.1f} pts", delta_color="off")
+        st.caption("The environment is the Democratic share of a generic statewide race (the average of "
+                   "AG/Auditor/SOS/Treasurer) with no candidates attached. Every projection is built on it; "
+                   "it is not any real race's vote share. Early-count skew is how far the first-counted "
+                   "ballots lean D relative to the final count.")
 
     st.subheader("Chambers")
     chamber_cols = st.columns(3)
@@ -211,4 +223,7 @@ with projection:
             st.subheader("Over the night")
             seat_cols = [c for c in hist.columns if c.startswith("seats_")]
             st.line_chart(hist.set_index("timestamp")[seat_cols])
-            st.line_chart(hist.set_index("timestamp")[["environment"]])
+            wp_cols = {"wp_governor": "Governor (D win likelihood)", "wp_us_senate": "US Senate (D win likelihood)"}
+            have = [c for c in wp_cols if c in hist.columns]
+            if have:
+                st.line_chart(hist.set_index("timestamp")[have].rename(columns=wp_cols))

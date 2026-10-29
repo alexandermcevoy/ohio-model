@@ -3380,12 +3380,43 @@ def congress_simulate(
 # Phase B — polls + fundamentals forecast (forecast_statewide.py)
 # ---------------------------------------------------------------------------
 
+def _print_statewide_headlines(headlines, live: bool = False) -> None:
+    """Polling Average + Win Likelihood for each statewide race (src/headlines.py)."""
+    import math
+
+    typer.echo("  STATEWIDE RACES" + (" (live)" if live else ""))
+    head = f"    {'Race':<22} {'Polling average':<42} {'80% range (margin)':<30}"
+    if live:
+        head += f" {'Live D%':>8} {'In':>6}"
+    head += f"  {'Win likelihood':<30}"
+    if live:
+        head += " Call"
+    typer.echo(head)
+    for h in headlines:
+        poll = h.polling.describe() if h.polling else "no public polls"
+        band = h.polling.band_text().removeprefix("80% range ") if h.polling else ""
+        line = f"    {h.label:<22} {poll:<42} {band:<30}"
+        if live:
+            live_d = "—" if h.live_d_share is None else f"{h.live_d_share:.1%}"
+            frac = "final" if h.is_final else ("" if h.live_fraction is None else f"{h.live_fraction:.0%}")
+            line += f" {live_d:>8} {frac:>6}"
+        line += f"  {h.win_text():<30}"
+        if live:
+            line += f" {h.call}"
+        typer.echo(line)
+    typer.echo("    Polling average = weighted raw toplines. 80% range = where the final margin lands 4 times in 5")
+    typer.echo("    if polls miss like they typically do (poll disagreement + a shared ±3-pt statewide miss).")
+    typer.echo("    Win likelihood = chance each candidate wins.")
+    typer.echo()
+
+
 def _run_office_forecast(
     office_name: str,
     n_sims: int = 10_000,
     with_incumbency: bool = False,
     include_historical: bool = True,
     seed: int = 42,
+    details: bool = False,
 ):
     import numpy as np
     import pandas as pd
@@ -3430,8 +3461,15 @@ def _run_office_forecast(
         as_of=as_of, n_samples=n_sims, seed=seed,
         include_historical_governor_baseline=include_historical,
     )
-    print_forecast_summary(summary)
-    typer.echo()
+    # Headlines are the statewide races' Polling Average and Win Likelihood;
+    # the blended environment itself is a model input, shown only with
+    # --details (see src/headlines.py docstring).
+    if details:
+        print_forecast_summary(summary)
+        typer.echo()
+    else:
+        from src.headlines import statewide_headlines
+        _print_statewide_headlines(statewide_headlines(as_of=as_of))
 
     # Ballot overrides (src/ballot_overrides.py): manually curated 2026 filing
     # facts the fundamentals model has no way to know (e.g. no Democrat filed
@@ -3474,6 +3512,9 @@ def _run_office_forecast(
         typer.echo()
 
     typer.echo(f"=== {office.display_name} — unconditional seat forecast ===\n")
+    win_thr = office.majority_threshold or office.current_d_seats
+    win_label = "D majority" if office.majority_threshold else f"D hold {win_thr}+"
+    typer.echo(f"  Win likelihood ({win_label}): {(result.seat_counts >= win_thr).mean():.1%}")
     typer.echo(f"  Mean D seats:   {result.mean_seats:.1f}")
     typer.echo(f"  Median:         {result.median_seats}")
     typer.echo(f"  80% CI:         [{result.p10_seats}, {result.p90_seats}]")
@@ -3578,7 +3619,8 @@ def _run_office_forecast(
     typer.echo(
         "\n  Note: this is a research-grade nowcast, not the final model — see "
         "CLAUDE.md's Polling Data section (MIN_OHIO_SIGMA, CANDIDATE_IDIOSYNCRASY_SIGMA) "
-        "for the judgment calls behind the environment uncertainty used here."
+        "for the judgment calls behind the environment uncertainty used here. "
+        "--details shows the environment inputs behind every projection."
     )
 
 
@@ -3740,10 +3782,11 @@ def house_forecast(
     with_incumbency: bool = typer.Option(False, "--with-incumbency"),
     include_historical: bool = typer.Option(True, "--include-historical/--no-historical"),
     seed: int = typer.Option(42, "--seed"),
+    details: bool = typer.Option(False, "--details", help="Show the environment model inputs (blend) instead of race headlines"),
 ):
     """Polls + fundamentals seat forecast for Ohio State House (Phase B). Top-level default; also `house forecast`."""
     _run_office_forecast("house", n_sims=n_sims, with_incumbency=with_incumbency,
-                          include_historical=include_historical, seed=seed)
+                          include_historical=include_historical, seed=seed, details=details)
 
 
 @senate_app.command("forecast")
@@ -3752,10 +3795,11 @@ def senate_forecast(
     with_incumbency: bool = typer.Option(False, "--with-incumbency"),
     include_historical: bool = typer.Option(True, "--include-historical/--no-historical"),
     seed: int = typer.Option(42, "--seed"),
+    details: bool = typer.Option(False, "--details", help="Show the environment model inputs (blend) instead of race headlines"),
 ):
     """Polls + fundamentals seat forecast for Ohio State Senate (Phase B)."""
     _run_office_forecast("senate", n_sims=n_sims, with_incumbency=with_incumbency,
-                          include_historical=include_historical, seed=seed)
+                          include_historical=include_historical, seed=seed, details=details)
 
 
 @congress_app.command("forecast")
@@ -3764,10 +3808,11 @@ def congress_forecast(
     with_incumbency: bool = typer.Option(False, "--with-incumbency"),
     include_historical: bool = typer.Option(True, "--include-historical/--no-historical"),
     seed: int = typer.Option(42, "--seed"),
+    details: bool = typer.Option(False, "--details", help="Show the environment model inputs (blend) instead of race headlines"),
 ):
     """Polls + fundamentals seat forecast for Ohio US House (Phase B)."""
     _run_office_forecast("congress", n_sims=n_sims, with_incumbency=with_incumbency,
-                          include_historical=include_historical, seed=seed)
+                          include_historical=include_historical, seed=seed, details=details)
 
 
 # ---------------------------------------------------------------------------
@@ -3779,36 +3824,30 @@ def _fmt_pct(x, digits: int = 1) -> str:
     return "—" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x * 100:.{digits}f}%"
 
 
-def _print_election_night(result, focus: str | None = None, n_close: int = 10) -> None:
+def _print_election_night(result, focus: str | None = None, n_close: int = 10, details: bool = False) -> None:
     """Terminal dashboard. focus=None prints every office; otherwise one chamber in full."""
     import math
+    from src.headlines import statewide_headlines
     from src.office import get_office
 
     races = result.races
-    e, e_sd = result.environment
-    e0, e0_sd = result.environment_prior
     typer.echo(f"=== Ohio Election Night — {result.as_of:%Y-%m-%d %H:%M:%S} ===\n")
     n_final = int(races["is_final"].sum())
     typer.echo(f"  Returns in: {result.n_observations} race(s) with partial counts ({n_final} fully counted)")
     for w in result.warnings:
         typer.echo(f"  ⚠ {w}")
-    typer.echo(
-        f"  Statewide environment (reference race): {_fmt_pct(e)} ± {_fmt_pct(e_sd)}"
-        f"   [pre-election {_fmt_pct(e0)} ± {_fmt_pct(e0_sd)}]"
-    )
-    s, s_sd = result.skew
-    typer.echo(f"  Early-count skew estimate: {s * 100:+.1f} ± {s_sd * 100:.1f} pts at 0% reporting\n")
-
-    typer.echo("  STATEWIDE RACES")
-    typer.echo(f"    {'Race':<22} {'Live D%':>8} {'In':>6}  {'Projected D%':>13} {'80% range':>15} {'P(D)':>6}  Call")
-    for r in races[races["office"] == "statewide"].itertuples():
-        live = _fmt_pct(r.live_d_share)
-        frac = "final" if r.is_final else (_fmt_pct(r.live_fraction, 0) if not math.isnan(r.live_fraction) else "")
-        rng = f"{_fmt_pct(r.proj_low80)}–{_fmt_pct(r.proj_high80)}"
-        typer.echo(f"    {r.label:<22} {live:>8} {frac:>6}  {_fmt_pct(r.proj_d_share):>13} {rng:>15} "
-                   f"{r.win_prob:6.1%}  {r.call}")
-    typer.echo("    (Row offices have no polling or candidate data: their projection is the environment alone.)")
+    if details:
+        e, e_sd = result.environment
+        e0, e0_sd = result.environment_prior
+        s, s_sd = result.skew
+        typer.echo(
+            f"  Model internals — environment (generic statewide race): {_fmt_pct(e)} ± {_fmt_pct(e_sd)}"
+            f" [pre-election {_fmt_pct(e0)} ± {_fmt_pct(e0_sd)}];"
+            f" early-count skew {s * 100:+.1f} ± {s_sd * 100:.1f} pts at 0% reporting"
+        )
     typer.echo()
+
+    _print_statewide_headlines(statewide_headlines(result), live=True)
 
     offices = [focus] if focus else ["house", "senate", "congress"]
     typer.echo("  CHAMBERS (D seats)")
@@ -3858,6 +3897,7 @@ def _run_election_night(
     early_skew: float | None = None,
     seed: int = 42,
     write: bool = True,
+    details: bool = False,
 ):
     """
     Read the live-returns CSVs under data/raw/, condition the joint pre-election
@@ -3881,7 +3921,7 @@ def _run_election_night(
         typer.echo(f"ERROR in live returns: {exc}", err=True)
         raise typer.Exit(1)
 
-    _print_election_night(result, focus=focus)
+    _print_election_night(result, focus=focus, details=details)
     if write:
         paths = en.write_outputs(result)
         typer.echo("  → " + "   ".join(str(p) for p in paths.values()))
@@ -3900,6 +3940,7 @@ _EN_SKEW = typer.Option(
 )
 _EN_SEED = typer.Option(42, "--seed")
 _EN_WRITE = typer.Option(True, "--write/--no-write", help="Write reports/election_night/ outputs")
+_EN_DETAILS = typer.Option(False, "--details", help="Also show model internals (environment, early-count skew)")
 
 
 @app.command("election-night")
@@ -3909,30 +3950,33 @@ def election_night_all(
     ),
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
+    details: bool = _EN_DETAILS,
 ):
     """Live projection for every Ohio race from manually entered returns. Also `house election-night`."""
     if office not in (None, "house", "senate", "congress"):
         typer.echo("--office must be house, senate or congress", err=True)
         raise typer.Exit(1)
-    _run_election_night(office, n_sims, with_incumbency, early_skew, seed, write)
+    _run_election_night(office, n_sims, with_incumbency, early_skew, seed, write, details)
 
 
 @senate_app.command("election-night")
 def senate_election_night(
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
+    details: bool = _EN_DETAILS,
 ):
     """Election-night projection, Ohio State Senate in full (same joint model)."""
-    _run_election_night("senate", n_sims, with_incumbency, early_skew, seed, write)
+    _run_election_night("senate", n_sims, with_incumbency, early_skew, seed, write, details)
 
 
 @congress_app.command("election-night")
 def congress_election_night(
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
+    details: bool = _EN_DETAILS,
 ):
     """Election-night projection, Ohio US House in full (same joint model)."""
-    _run_election_night("congress", n_sims, with_incumbency, early_skew, seed, write)
+    _run_election_night("congress", n_sims, with_incumbency, early_skew, seed, write, details)
 
 
 @multi_app.command("backbone")
