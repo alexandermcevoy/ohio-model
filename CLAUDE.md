@@ -73,6 +73,13 @@ python cli.py senate report                    # one-page office summary PDF (se
 python cli.py congress report                  # one-page office summary PDF (congress)
 python cli.py multi report                     # generate summary PDFs for all 3 offices
 
+# Election night — live returns -> joint projection for every Ohio race
+python cli.py election-night                   # all races: statewide, House, Senate, US House
+python cli.py election-night --office house    # one chamber in full (also senate/congress election-night)
+python cli.py election-night --early-skew 4    # prior: first-counted ballots run 4 pts D of final
+# Returns go in data/raw/live_returns_oh_{statewide,house,senate,congress}.csv,
+# or the Streamlit "Election Night" page (same files, same computation).
+
 # Individual modules can be imported and called independently:
 python -c "from src.ingest_sos import load_sos_file; f = load_sos_file('data/raw/statewide-races-by-precinct.xlsx')"
 ```
@@ -1049,6 +1056,21 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - **The national fundamentals signal is now the largest blend weight (44%), and it sits on a presidential-anchored scale.** `OHIO_VS_NATIONAL_OFFSET_MEAN` (−5.63) comes from Ohio-vs-national *presidential* vote in 2020/2024, but it now feeds an estimate of the midterm down-ballot reference. Ohio's midterm reference moved from 47.7% (2018) to 40.7% (2022), so carrying the presidential offset over is an unvalidated assumption. Midterm national vote share is still uncollected (see Known gaps).
 - **Senate and congress σ_shared come from race history the repo already flags as unreliable.** Congress `years_reliable_for_race_history` is empty for every CD (new Oct 2025 map), and senate odd-district 2022 results are joined across maps by district number. `compute_shared_sigma` still reads their `candidate_effect_{year}` columns (senate τ = 2.57, congress τ = 1.38), so those forecasts' widths inherit that contamination.
 - **`reports/methodology.md` is the document meant for publication**, and it now misdescribes both the reference race and σ. Rewrite it before anything public. `reports/session8/README.md` and `reports/session5/methodology.md` also quote pre-change σ and seat numbers.
+
+### Election Night mode (2026-10-29)
+
+`src/election_night.py` replaces the per-office `src/nowcast.py` (deleted). One joint Gaussian over every 2026 Ohio race, conditioned on hand-entered returns:
+
+- **Races**: Governor, US Senate special, AG/Auditor/SOS/Treasurer, all 99 House seats, the 17 odd Ohio Senate seats, 15 US House seats. Senate even districts are fixed holdovers (current holder); HD-64 is fixed R via `ballot_overrides.py`; any entered race with one party at 0 votes is fixed as uncontested and kept out of the Gaussian.
+- **State**: E (reference statewide share) + race deviations (gov, uss with Brown's +3.7 offset, row offices constrained to sum to zero, sd measured 2010–2022) + per-office offset η (σ_shared, `ETA_CROSS_OFFICE_CORR` = 0) + district ε (σ_i). Every return moves every race through E.
+- **Pre-election prior reproduces the published forecast**: E equals `build_forecast()` exactly (asserted at build time); House 40.2 [32, 48] and Congress 5.4 [3, 8] match `forecast`. Ohio Senate shows ~11.0 instead of the `senate forecast` 12.7 because holdovers are fixed rather than simulated.
+- **Shared early-count skew**: each partial count loads on one skew term × (1 − fraction reported), so a uniform early/absentee lean is not read as the environment. Prior N(`--early-skew`, 6 pts).
+- **Judgment calls (not fitted)**: `TAU_FLOOR` 1 pt, `TAU_SCALE` 10 pts (was 17.5 in nowcast.py, which had no skew term), `EARLY_COUNT_SKEW_SD` 6 pts, `STATEWIDE_POLL_ERROR_SD` 3 pts (shared gov/Senate polling error added to the race layer only, so E stays the published blend; Ohio polls missed toward D by ~2–3.5 pts in 2018–2024, mean left at 0). With it, pre-election P(Acton) ≈ 49% and P(Brown) ≈ 81% on the 9/11 poll files; after the 10/29 poll refresh, 64% and 75% (House 39.9 seats). These move with every poll refresh.
+- **Reporting fraction**: entered `pct_reporting` (preferred) or votes ÷ 2022 governor two-party total in the *current* district, built from block vote surfaces through the current map.
+- **Outputs**: `reports/election_night/latest_races.csv`, `latest_chambers.csv`, and `history.csv` (one row per run/save).
+- **GUI**: `pages/7_Election_Night.py` (enter returns → Save & recompute → projection, seat histograms, history). The `Streamlit (system python)` launch config runs on port 8502 because `python3` on PATH lacks the project's packages. Editor widget keys carry a version that bumps on every Save and on "Reload from files", so typed edits are never re-applied over newer CSV contents (verified: a hand edit to the CSV survives Reload + Save).
+- **Prior date**: `prior_as_of()` = min(today, `ELECTION_DAY` 2026-11-03), so the prior doesn't shift at midnight during the count.
+- **Verified 2026-10-29**: (1) every race final → seat std 0 in each chamber, mean = entered D winners + fixed D. (2) False-call stress test, 30 trials per scenario, truths drawn from the prior, every race at 10–40% reporting: wrong ≥99% calls among races not already ≥99% pre-election were 0.22% (true skew 0), 0.00% (+10 pts), 0.75% (+10, half the races reporting), 0.35% (−10), 0.48% (+10 with 1.5× geographic noise). Under 1% in every case, so `TAU_SCALE`/`CALL_THRESHOLD` were left as is. Small n; a diagnostic, not a calibration.
 
 ### Deferred: Natural Language Query Interface
 - Claude API integration — pushed back; unnecessary for current stakeholder needs.
