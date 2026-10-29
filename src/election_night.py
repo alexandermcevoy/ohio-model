@@ -150,6 +150,52 @@ E keeps the published blend's sd (MIN_OHIO_SIGMA floor).
 
 CALL_THRESHOLD: float = 0.99
 
+# --- County layer / SOS feed (src/enr_feed.py, src/county_layer.py) ---------
+# Judgment calls like the ones above; none is fitted to Ohio reporting data.
+
+ABSENTEE_GAP_MEAN: float = 0.10
+ABSENTEE_GAP_SD: float = 0.08
+"""
+Prior on Delta: D two-party share of absentee (early + mail) ballots minus
+that of Election Day ballots, shared statewide. The feed reports absentee
+ballots cast per county but not who they voted for, so Delta is estimated
+from how counted shares move as each county's mix of absentee and Election
+Day ballots changes. The prior is wide; the returns do most of the work.
+"""
+
+COUNTY_GAP_SD: float = 0.045
+"""
+How much a county's own absentee-vs-Election-Day gap can differ from the
+statewide Delta. Without it the model would read cross-county differences in
+absentee mix as if every county had the same gap, and pin Delta (and the
+environment) far too early. Added to each county's composition noise as
+(Delta loading x COUNTY_GAP_SD)^2. Chosen before looking at rehearsal
+coverage; do not tune it to a replay.
+"""
+
+COUNTY_TAU_FLOOR: float = 0.004
+COUNTY_TAU_SCALE: float = 0.05
+"""
+How far a county's counted ballots can differ from its eventual whole
+(which precincts are in), after the absentee/Election-Day mix is accounted
+for: sqrt(floor^2 + scale^2 (1 - f)^2). Shared by every race counted in that
+county, since they are tallies of the same ballots.
+"""
+
+ABSENTEE_PRIOR_SHARE: float = 0.35   # absentee share of a county's ballots before it reports any
+RESIDUAL_FRACTION: float = 0.02      # late absentee + provisional ballots still out when precincts hit 100%
+BALLOTS_PER_VOTE: float = 1.03       # ballots per two-party governor vote before a county reports
+TURNOUT_PRIOR_MEAN: float = 1.0      # 2026 two-party turnout relative to 2022 governor
+TURNOUT_PRIOR_SD: float = 0.12
+COUNTY_TURNOUT_SD: float = 0.06      # county turnout noise around the statewide factor
+PRECINCT_EXTRAPOLATION_MIN: float = 0.5   # precinct share at which a county's own turnout takes over
+CALL_GUARD: float = 0.30
+"""
+No CALL while the counted margin is smaller than CALL_GUARD x the expected
+outstanding vote, whatever the posterior says: the remaining ballots would
+only need to break 65/35 against the leader to flip it.
+"""
+
 FINAL_TAU: float = 1e-4  # sd for a fully counted race; tiny but keeps the solve well-conditioned
 
 # Seat thresholds worth a probability on the dashboard, per office.
@@ -190,6 +236,8 @@ class PriorModel:
     environment_prior: tuple[float, float]
     as_of: pd.Timestamp
     notes: list[str] = field(default_factory=list)
+    county: object | None = None        # county_layer.CountyInputs
+    race_const: dict[str, float] = field(default_factory=dict)  # statewide race key -> const
 
     def index(self, name: str) -> int:
         return self.state_names.index(name)
@@ -334,11 +382,39 @@ def build_prior_model(
     means += [0.0] * k
     blocks.append(row_sd**2 * k / (k - 1) * (np.eye(k) - np.ones((k, k)) / k))
 
+    # County layer: each statewide race in county c is
+    #   E + dev_race + const + lean_c + u_c + v_{c,race}.
+    # Leans are relative to the state, so the county deviations u (shared by
+    # every race in the county) and v (race-specific) are centered: their
+    # turnout-weighted sum is 0 by construction (cov = s^2 M M', M = I - 1 w').
+    # Counties then only redistribute a statewide result geographically, and
+    # with nothing counted every statewide race keeps exactly its published
+    # mean and variance.
+    from src.county_layer import county_inputs
+
+    ci = county_inputs()
+    w = ci.counties["weight"].to_numpy()
+    fips = ci.counties["fips"].tolist()
+    centered = np.eye(len(fips)) - np.outer(np.ones(len(fips)), w)
+    centered_cov = centered @ centered.T
+    names += ["delta"]
+    means += [ABSENTEE_GAP_MEAN]
+    blocks.append(np.array([[ABSENTEE_GAP_SD**2]]))
+    names += [f"u_{f}" for f in fips]
+    means += [0.0] * len(fips)
+    blocks.append(centered_cov * ci.sigma_u**2)
+    for sr in STATEWIDE_RACES:
+        names += [f"v_{sr.key}_{f}" for f in fips]
+        means += [0.0] * len(fips)
+        blocks.append(centered_cov * ci.sigma_v[sr.key] ** 2)
+
     races: list[RaceRow] = []
     expected: dict[str, float] = {}
+    race_const: dict[str, float] = {}
     sw_total = _statewide_turnout_2022()
     for sr in STATEWIDE_RACES:
         const = uss_offset if sr.key == "us_senate" else 0.0
+        race_const[sr.key] = const
         rid = f"statewide:{sr.key}"
         races.append(RaceRow(rid, "statewide", None, sr.label, const, {"E": 1.0, sr.dev_state: 1.0}))
         expected[rid] = sw_total
@@ -423,6 +499,8 @@ def build_prior_model(
         environment_prior=(float(env_m[0]), float(env_P[0, 0] ** 0.5)),
         as_of=as_of,
         notes=notes,
+        county=ci,
+        race_const=race_const,
     )
 
 
@@ -619,6 +697,204 @@ def parse_returns(
     return obs, uncontested, warnings
 
 
+
+# ---------------------------------------------------------------------------
+# SOS feed: turnout, outstanding vote, observations
+# ---------------------------------------------------------------------------
+
+def estimate_turnout(model: PriorModel, snap) -> tuple[pd.DataFrame, float, float]:
+    """
+    Expected final two-party (governor) vote per county and how the counted
+    ballots are composed.
+
+    Before a county's precincts are substantially in, its expected vote is
+    2022 turnout x a statewide factor g. g starts at TURNOUT_PRIOR_MEAN and
+    is learned from counties with at least PRECINCT_EXTRAPOLATION_MIN of
+    precincts reported (absentee + Election-Day ballots extrapolated by the
+    precinct share). The first absentee batch arrives with 0 precincts
+    reported, so precinct share alone would read it as a whole county.
+
+    Returns (per-county frame, g mean, g sd).
+    """
+    ci = model.county
+    c = ci.counties.merge(snap.counties, on="fips", how="left")
+    gov = snap.statewide[snap.statewide["race"] == "governor"].set_index("fips") if len(snap.statewide) else None
+    t_gov = (gov["dem_votes"] + gov["rep_votes"]).reindex(c["fips"]).fillna(0).to_numpy() if gov is not None \
+        else np.zeros(len(c))
+    c["t_gov"] = t_gov
+    B = c["ballots_total"].fillna(0).to_numpy(float)
+    A = c["ballots_absentee"].fillna(0).to_numpy(float)
+    p = (c["precincts_reported"] / c["precincts_total"].replace(0, np.nan)).fillna(0).to_numpy()
+    complete = c["count_status"].fillna("").str.lower().isin(["completed", "complete", "final"]).to_numpy()
+    kappa = np.where(t_gov > 0, B / np.maximum(t_gov, 1), BALLOTS_PER_VOTE)
+    kappa = np.clip(kappa, 1.0, 1.25)
+
+    # County's own projection of its final ballots, where precincts allow it.
+    own = np.full(len(c), np.nan)
+    ok = (p >= PRECINCT_EXTRAPOLATION_MIN) & (B > A)
+    own[ok] = A[ok] + (B[ok] - A[ok]) / p[ok]
+    own[complete] = B[complete] * (1 + RESIDUAL_FRACTION)
+    own_votes = own / kappa
+    base = c["base_votes"].to_numpy()
+
+    has_own = np.isfinite(own_votes)
+    share_known = float(base[has_own].sum() / base.sum()) if has_own.any() else 0.0
+    if has_own.any():
+        ratio = float(np.average(own_votes[has_own] / base[has_own], weights=base[has_own]))
+        g = (1 - share_known) * TURNOUT_PRIOR_MEAN + share_known * ratio
+    else:
+        g = TURNOUT_PRIOR_MEAN
+    g_sd = TURNOUT_PRIOR_SD * (1 - share_known) + 0.02 * share_known
+
+    n_hat = np.where(has_own, own_votes, base * g)
+    n_sd = np.where(has_own, own_votes * 0.10 * (1 - np.clip(p, 0, 1)), base * COUNTY_TURNOUT_SD)
+    n_sd[complete] = (B[complete] / kappa[complete]) * RESIDUAL_FRACTION / 2
+    floor = np.maximum(t_gov, B / kappa) * (1 + RESIDUAL_FRACTION)
+    n_hat = np.maximum(n_hat, floor)
+
+    nb = n_hat * kappa                                   # expected final ballots
+    a_final = np.where(complete, A / np.maximum(B, 1),
+                       np.where(A > 0, A * (1 + RESIDUAL_FRACTION) / nb, ABSENTEE_PRIOR_SHARE))
+    a_final = np.clip(a_final, 0, 1)
+    f = np.clip(B / nb, 0, 1 - RESIDUAL_FRACTION / 2)
+    counted_abs = np.where(B > 0, A / np.maximum(B, 1), 0.0)
+    loading = np.where(B > 0, counted_abs - a_final, 0.0)  # Delta loading of the counted share
+    tau = np.sqrt(COUNTY_TAU_FLOOR**2 + COUNTY_TAU_SCALE**2 * (1 - f) ** 2 + (loading * COUNTY_GAP_SD) ** 2)
+
+    c = c.assign(precinct_frac=p, complete=complete, kappa=kappa, n_hat=n_hat, n_sd=n_sd, has_own=has_own,
+                 absentee_final=a_final, fraction=f, delta_loading=loading, tau=tau, ballots=B, absentee=A)
+    return c, float(g), float(g_sd)
+
+
+def absentee_missing(snap) -> bool:
+    """Ballots are being counted but the feed reports no absentee ballots anywhere."""
+    return bool(snap.counties["ballots_total"].sum() > 0 and snap.counties["ballots_absentee"].sum() == 0)
+
+
+@dataclass
+class FeedObservations:
+    H: np.ndarray
+    y: np.ndarray
+    R: np.ndarray
+    records: list[dict]          # one per observation, for reporting
+    race_ids: set[str]           # races with any feed data
+    uncontested: dict[str, str]  # race_id -> winner, from the feed's candidate list
+    turnout: pd.DataFrame
+    g: tuple[float, float]
+
+
+def feed_observations(model: PriorModel, snap) -> FeedObservations:
+    """County observations for statewide races and district observations for legislative ones."""
+    turnout, g, g_sd = estimate_turnout(model, snap)
+    no_absentee = absentee_missing(snap)
+    if no_absentee:
+        # Without absentee counts the mix of counted ballots is unknown; fall
+        # back to the manual-entry early-count skew, (1 - fraction) x skew.
+        turnout["delta_loading"] = 0.0
+        turnout["tau"] = np.sqrt(COUNTY_TAU_FLOOR**2 + COUNTY_TAU_SCALE**2 * (1 - turnout["fraction"]) ** 2)
+    idx = {n: i for i, n in enumerate(model.state_names)}
+    races = {r.race_id: r for r in model.races}
+    t_by_fips = turnout.set_index("fips")
+    lean = t_by_fips["lean"]
+    rows_h, rows_y, records = [], [], []
+    noise_groups: list[str] = []   # observations sharing a group share composition noise
+    noise_sd: list[float] = []
+    race_ids: set[str] = set()
+    uncontested: dict[str, str] = {}
+
+    # Statewide: one observation per county x race, composition noise shared within county.
+    for r in (snap.statewide.itertuples() if len(snap.statewide) else []):
+        tot = r.dem_votes + r.rep_votes
+        rid = f"statewide:{r.race}"
+        if tot <= 0 or not (r.has_dem and r.has_rep) or rid not in races:
+            continue
+        race_ids.add(rid)
+        tc = t_by_fips.loc[r.fips]
+        h = np.zeros(len(idx))
+        sr = next(x for x in STATEWIDE_RACES if x.key == r.race)
+        h[idx["E"]] = 1.0
+        h[idx[sr.dev_state]] = 1.0
+        h[idx[f"u_{r.fips}"]] = 1.0
+        h[idx[f"v_{r.race}_{r.fips}"]] = 1.0
+        h[idx["delta"]] = tc["delta_loading"]
+        if no_absentee:
+            h[idx["skew"]] = 1 - tc["fraction"]
+        rows_h.append(h)
+        rows_y.append(r.dem_votes / tot - model.race_const[r.race] - lean[r.fips])
+        noise_groups.append(f"county:{r.fips}")
+        noise_sd.append(float(tc["tau"]))
+        records.append({"race_id": rid, "fips": r.fips, "dem": r.dem_votes, "rep": r.rep_votes})
+
+    # Legislative: one observation per district, summed over its county pieces.
+    pieces = model.county.pieces
+    if len(snap.legislative):
+        ratio = (t_by_fips["n_hat"] / t_by_fips["base_votes"]).to_dict()
+        for (office, district), grp in snap.legislative.groupby(["office", "district"]):
+            rid = f"{office}:{int(district)}"
+            race = races.get(rid)
+            if race is None or race.fixed_winner is not None:
+                continue
+            has_dem, has_rep = bool(grp["has_dem"].iloc[0]), bool(grp["has_rep"].iloc[0])
+            if not (has_dem and has_rep):
+                if has_dem or has_rep:
+                    uncontested[rid] = "D" if has_dem else "R"
+                continue
+            dem, rep = int(grp["dem_votes"].sum()), int(grp["rep_votes"].sum())
+            if dem + rep <= 0:
+                continue
+            race_ids.add(rid)
+            pc = pieces[(pieces["office"] == office) & (pieces["district"] == district)].set_index("fips")
+            n_pieces = pc["base_votes"] * pc.index.map(ratio)
+            n_i = float(n_pieces.sum())
+            counted = grp.set_index("fips")[["dem_votes", "rep_votes"]].sum(axis=1)
+            t_i = float(counted.sum())
+            # Each piece's counted ballots are assumed to have its county's absentee mix.
+            abs_frac = (t_by_fips["absentee"] / t_by_fips["ballots"].replace(0, np.nan)).fillna(0)
+            comp_counted = float((counted * abs_frac.reindex(counted.index)).sum() / t_i)
+            comp_final = float((n_pieces * t_by_fips.loc[n_pieces.index, "absentee_final"]).sum() / max(n_i, 1))
+            frac = min(t_i / max(n_i, 1), 1 - RESIDUAL_FRACTION / 2)
+            h = _loading_vector(model, race)
+            d_load = 0.0 if no_absentee else comp_counted - comp_final
+            h[idx["delta"]] = d_load
+            if no_absentee:
+                h[idx["skew"]] = 1 - frac
+            rows_h.append(h)
+            rows_y.append(dem / (dem + rep) - race.const)
+            noise_groups.append(rid)
+            noise_sd.append(float(np.sqrt(TAU_FLOOR**2 + TAU_SCALE**2 * (1 - frac) ** 2 + (d_load * COUNTY_GAP_SD) ** 2)))
+            records.append({"race_id": rid, "fips": None, "dem": dem, "rep": rep,
+                            "expected": n_i, "fraction": frac})
+
+    # Contests on the ballot with only one major party, from the candidate list.
+    cands = snap.candidates
+    if len(cands):
+        for (office, key), grp in cands.groupby(["office", "key"]):
+            rid = f"{office}:{key}" if office != "statewide" else f"statewide:{key}"
+            race = races.get(rid)
+            parties = set(grp["party"])
+            if race is not None and race.fixed_winner is None and parties in ({"D"}, {"R"}):
+                uncontested[rid] = parties.pop()
+
+    n = len(rows_y)
+    R = np.zeros((n, n))
+    groups = pd.Series(noise_groups)
+    for g_name, members in groups.groupby(groups).groups.items():
+        mi = np.array(list(members))
+        sd = noise_sd[mi[0]]
+        R[np.ix_(mi, mi)] = sd**2
+    R += np.eye(n) * 1e-8
+    return FeedObservations(
+        H=np.array(rows_h) if n else np.zeros((0, len(idx))),
+        y=np.array(rows_y),
+        R=R,
+        records=records,
+        race_ids=race_ids,
+        uncontested=uncontested,
+        turnout=turnout,
+        g=(g, g_sd),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Posterior
 # ---------------------------------------------------------------------------
@@ -636,10 +912,18 @@ def condition(
     *,
     tau_floor: float = TAU_FLOOR,
     tau_scale: float = TAU_SCALE,
+    extra: "FeedObservations | None" = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Gaussian conditioning of the state on every current observation, from the original prior."""
-    if not observations:
+    """
+    Gaussian conditioning of the state on every current observation, from the
+    original prior: manual entries (diagonal noise, early-count skew) plus
+    feed observations (correlated composition noise, absentee gap).
+    """
+    if not observations and (extra is None or len(extra.y) == 0):
         return model.mean.copy(), model.cov.copy()
+    if not observations:
+        H, y, R = extra.H, extra.y, extra.R
+        return _gaussian_update(model.mean, model.cov, H, y, R)
 
     races = {r.race_id: r for r in model.races}
     skew_i = model.index("skew")
@@ -657,13 +941,20 @@ def condition(
         H[i, skew_i] = 1 - f
         r[i] = tau_floor**2 + tau_scale**2 * (1 - f) ** 2
 
-    P = model.cov
-    S = H @ P @ H.T + np.diag(r)
+    R = np.diag(r)
+    if extra is not None and len(extra.y):
+        H = np.vstack([H, extra.H])
+        y = np.concatenate([y, extra.y])
+        R = np.block([[R, np.zeros((len(r), len(extra.y)))], [np.zeros((len(extra.y), len(r))), extra.R]])
+    return _gaussian_update(model.mean, model.cov, H, y, R)
+
+
+def _gaussian_update(m0, P, H, y, R) -> tuple[np.ndarray, np.ndarray]:
+    S = H @ P @ H.T + R
     K = np.linalg.solve(S, H @ P).T
-    m = model.mean + K @ (y - H @ model.mean)
+    m = m0 + K @ (y - H @ m0)
     P_post = P - K @ H @ P
-    P_post = (P_post + P_post.T) / 2
-    return m, P_post
+    return m, (P_post + P_post.T) / 2
 
 
 @dataclass
@@ -677,6 +968,9 @@ class ElectionNightResult:
     seat_counts: dict[str, np.ndarray]
     n_observations: int
     warnings: list[str]
+    absentee_gap: tuple[float, float] = (ABSENTEE_GAP_MEAN, ABSENTEE_GAP_SD)
+    outstanding: pd.DataFrame | None = None    # per county, governor race
+    feed: dict | None = None                   # generated time, test flag, file
 
 
 def _call_label(row) -> str:
@@ -689,9 +983,10 @@ def _call_label(row) -> str:
         return f"BALLOT {row['winner']}"
     if row["is_final"]:
         return f"FINAL {'D' if row['win_prob'] > 0.5 else 'R'}"
-    if row["win_prob"] >= CALL_THRESHOLD:
+    guarded = bool(row.get("call_guard", False))
+    if row["win_prob"] >= CALL_THRESHOLD and not guarded:
         return "CALL D"
-    if row["win_prob"] <= 1 - CALL_THRESHOLD:
+    if row["win_prob"] <= 1 - CALL_THRESHOLD and not guarded:
         return "CALL R"
     if row["win_prob"] >= 0.75:
         return "likely D"
@@ -700,18 +995,119 @@ def _call_label(row) -> str:
     return "too close"
 
 
+def _statewide_simulation(model: PriorModel, draws: np.ndarray, fo: "FeedObservations | None",
+                          rng: np.random.Generator) -> dict[str, np.ndarray]:
+    """
+    Final two-party D share of each statewide race, per draw: sum over
+    counties of N_c * share_c / sum N_c, with N_c drawn around the expected
+    turnout (statewide factor g plus county noise). Counted votes are in each
+    county's share through the conditioning; what is left is how the
+    outstanding vote breaks and how much of it there is.
+    """
+    ci = model.county
+    fips = ci.counties["fips"].tolist()
+    idx = {n: i for i, n in enumerate(model.state_names)}
+    lean = ci.counties["lean"].to_numpy()
+    base = ci.counties["base_votes"].to_numpy()
+    n = draws.shape[0]
+    if fo is not None:
+        t = fo.turnout.set_index("fips").reindex(fips)
+        g = rng.normal(fo.g[0], fo.g[1], size=(n, 1))
+        own = t["has_own"].to_numpy()
+        n_hat = t["n_hat"].to_numpy()
+        noise = rng.standard_normal((n, len(fips)))
+        n_draw = np.where(own, n_hat + noise * t["n_sd"].to_numpy(),
+                          base * g * (1 + COUNTY_TURNOUT_SD * noise))
+        n_draw = np.maximum(n_draw, t["t_gov"].to_numpy())
+    else:
+        g = rng.normal(TURNOUT_PRIOR_MEAN, TURNOUT_PRIOR_SD, size=(n, 1))
+        n_draw = base * g * (1 + COUNTY_TURNOUT_SD * rng.standard_normal((n, len(fips))))
+    n_draw = np.maximum(n_draw, 1.0)
+    u = draws[:, [idx[f"u_{f}"] for f in fips]]
+    out = {}
+    for sr in STATEWIDE_RACES:
+        v = draws[:, [idx[f"v_{sr.key}_{f}"] for f in fips]]
+        share = (draws[:, [idx["E"]]] + draws[:, [idx[sr.dev_state]]] + model.race_const[sr.key]
+                 + lean + u + v)
+        out[sr.key] = (share * n_draw).sum(axis=1) / n_draw.sum(axis=1)
+    out["_county_gov_share"] = (draws[:, [idx["E"]]] + draws[:, [idx["dev_gov"]]] + lean + u
+                                + draws[:, [idx[f"v_governor_{f}"] for f in fips]])
+    out["_n_draw"] = n_draw
+    return out
+
+
+def _outstanding_table(model: PriorModel, fo: "FeedObservations", sim: dict, snap) -> pd.DataFrame:
+    """Per county: counted vs expected governor vote and how the outstanding vote should break."""
+    t = fo.turnout.copy()
+    gov = snap.statewide[snap.statewide["race"] == "governor"].set_index("fips")
+    t["dem_counted"] = gov["dem_votes"].reindex(t["fips"]).fillna(0).to_numpy()
+    t["rep_counted"] = gov["rep_votes"].reindex(t["fips"]).fillna(0).to_numpy()
+    share_mean = sim["_county_gov_share"].mean(axis=0)
+    n_mean = sim["_n_draw"].mean(axis=0)
+    counted = t["dem_counted"] + t["rep_counted"]
+    remaining = np.maximum(n_mean - counted, 0)
+    dem_final = share_mean * n_mean
+    dem_remaining = np.clip(dem_final - t["dem_counted"], 0, remaining)
+    t = t.assign(
+        expected_votes=n_mean,
+        counted_votes=counted,
+        remaining_votes=remaining,
+        counted_d_share=np.where(counted > 0, t["dem_counted"] / counted.replace(0, np.nan), np.nan),
+        remaining_d_share=np.where(remaining > 0, dem_remaining / np.maximum(remaining, 1), np.nan),
+        remaining_net_d=2 * dem_remaining - remaining,
+        projected_d_share=share_mean,
+    )
+    cols = ["fips", "name", "precinct_frac", "ballots", "absentee", "expected_votes", "counted_votes",
+            "remaining_votes", "counted_d_share", "remaining_d_share", "remaining_net_d", "projected_d_share",
+            "complete"]
+    return t[cols].sort_values("remaining_votes", ascending=False).reset_index(drop=True)
+
+
 def run_election_night(
     model: PriorModel,
     frames: dict[str, pd.DataFrame] | None = None,
     *,
+    feed=None,
     n_sims: int = 10_000,
     seed: int = 42,
 ) -> ElectionNightResult:
-    """Condition the prior on the current returns and summarize every race and chamber."""
+    """
+    Condition the prior on the current returns and summarize every race and
+    chamber. `feed` is an enr_feed.FeedSnapshot; when given, it is the source
+    for every race it covers and manual entries for those races are ignored.
+    """
     observations, uncontested, warnings = parse_returns(model, frames)
-    m, P = condition(model, observations)
+    fo = None
+    feed_meta = None
+    if feed is not None:
+        fo = feed_observations(model, feed)
+        overlap = sorted({o.race_id for o in observations} & fo.race_ids)
+        if overlap:
+            warnings.append(f"Manual entries ignored where the SOS feed has data: {', '.join(overlap)}")
+            observations = [o for o in observations if o.race_id not in fo.race_ids]
+        for rid, winner in fo.uncontested.items():
+            uncontested.setdefault(rid, winner)
+        if feed.is_test:
+            warnings.append("SOS FEED IS TEST/MOCK DATA (IsTest or mock-election notes). Not real results.")
+        if absentee_missing(feed):
+            warnings.append("SOS feed reports NO absentee ballots in any county while ballots are being counted; "
+                            "using the generic early-count skew instead of the absentee mix (--early-skew sets its prior).")
+        warnings.extend(feed.warnings)
+        from src.enr_feed import self_check
+        feed_meta = {"generated": feed.generated, "is_test": feed.is_test,
+                     "file": str(feed.source) if feed.source else None, "g": fo.g,
+                     "self_check": self_check(feed)}
+    m, P = condition(model, observations, extra=fo)
 
     obs_by = {o.race_id: o for o in observations}
+    feed_by: dict[str, dict] = {}
+    if fo is not None:
+        for rec in fo.records:
+            agg = feed_by.setdefault(rec["race_id"], {"dem": 0, "rep": 0, "expected": rec.get("expected"),
+                                                      "fraction": rec.get("fraction")})
+            agg["dem"] += rec["dem"]
+            agg["rep"] += rec["rep"]
+
     uncertain = [r for r in model.races if r.fixed_winner is None and r.race_id not in uncontested]
     H = np.array([_loading_vector(model, r) for r in uncertain])
     c = np.array([r.const for r in uncertain])
@@ -719,17 +1115,45 @@ def run_election_night(
     share_var = np.einsum("ij,jk,ik->i", H, P, H)
     share_sd = np.sqrt(np.clip(share_var, 1e-12, None))
     win_prob = 1 - norm.cdf((0.5 - share_mean) / share_sd)
+    stats = {r.race_id: (mu, sd, wp, mu - 1.2816 * sd, mu + 1.2816 * sd)
+             for r, mu, sd, wp in zip(uncertain, share_mean, share_sd, win_prob)}
+
+    rng = np.random.default_rng(seed)
+    L = np.linalg.cholesky(P + np.eye(len(m)) * 1e-10)
+    draws = m + rng.standard_normal((n_sims, len(m))) @ L.T
+
+    # Statewide races: simulate turnout-weighted county results.
+    sim = _statewide_simulation(model, draws, fo, rng)
+    sw_total_expected = float(sim["_n_draw"].mean(axis=0).sum())
+    for sr in STATEWIDE_RACES:
+        f = sim[sr.key]
+        stats[f"statewide:{sr.key}"] = (float(f.mean()), float(f.std()), float((f > 0.5).mean()),
+                                        float(np.quantile(f, 0.1)), float(np.quantile(f, 0.9)))
 
     rows = []
-    stats = {r.race_id: (mu, sd, wp) for r, mu, sd, wp in zip(uncertain, share_mean, share_sd, win_prob)}
     for race in model.races:
         o = obs_by.get(race.race_id)
+        fd = feed_by.get(race.race_id)
         fixed = race.fixed_winner or uncontested.get(race.race_id)
-        reason = race.fixed_reason or ("uncontested in entered returns" if race.race_id in uncontested else None)
+        reason = race.fixed_reason or ("uncontested" if race.race_id in uncontested else None)
         if fixed:
-            mu, sd, wp = (np.nan, np.nan, 1.0 if fixed == "D" else 0.0)
+            mu, sd, wp, lo, hi = (np.nan, np.nan, 1.0 if fixed == "D" else 0.0, np.nan, np.nan)
         else:
-            mu, sd, wp = stats[race.race_id]
+            mu, sd, wp, lo, hi = stats[race.race_id]
+        live_dem = live_rep = live_frac = np.nan
+        source = ""
+        guard = False
+        if fd is not None:
+            live_dem, live_rep = fd["dem"], fd["rep"]
+            expected = sw_total_expected if race.office == "statewide" else fd["expected"]
+            live_frac = min((live_dem + live_rep) / expected, 1.0) if expected else np.nan
+            source = "sos_feed"
+            outstanding = max(expected - (live_dem + live_rep), RESIDUAL_FRACTION * expected) if expected else 0
+            guard = abs(live_dem - live_rep) < CALL_GUARD * outstanding
+        elif o is not None:
+            live_dem, live_rep, live_frac, source = o.dem_votes, o.rep_votes, o.fraction, o.fraction_source
+        elif race.office == "statewide" and fo is not None:
+            guard = True  # statewide race with no counted votes yet
         rows.append({
             "race_id": race.race_id,
             "office": race.office,
@@ -739,26 +1163,23 @@ def run_election_night(
             "open_seat_2026": race.open_seat,
             "proj_d_share": mu,
             "proj_sd": sd,
-            "proj_low80": mu - 1.2816 * sd if not fixed else np.nan,
-            "proj_high80": mu + 1.2816 * sd if not fixed else np.nan,
+            "proj_low80": lo,
+            "proj_high80": hi,
             "win_prob": wp,
             "winner": fixed or ("D" if wp > 0.5 else "R"),
             "fixed_reason": reason or "",
-            "live_dem_votes": o.dem_votes if o else np.nan,
-            "live_rep_votes": o.rep_votes if o else np.nan,
-            "live_d_share": o.share if o else np.nan,
-            "live_fraction": o.fraction if o else np.nan,
-            "fraction_source": o.fraction_source if o else "",
+            "live_dem_votes": live_dem,
+            "live_rep_votes": live_rep,
+            "live_d_share": live_dem / (live_dem + live_rep) if (live_dem + live_rep) > 0 else np.nan,
+            "live_fraction": live_frac,
+            "fraction_source": source,
             "is_final": bool(o.is_final) if o else False,
+            "call_guard": guard,
         })
     races_df = pd.DataFrame(rows)
     races_df["call"] = races_df.apply(_call_label, axis=1)
 
-    # Seat distributions: joint draws of the uncertain races plus fixed outcomes.
-    rng = np.random.default_rng(seed)
-    L = np.linalg.cholesky(P + np.eye(len(m)) * 1e-12)
-    z = rng.standard_normal((n_sims, len(m)))
-    draws = m + z @ L.T
+    # Seat distributions: joint draws of the uncertain legislative races plus fixed outcomes.
     shares = c + draws @ H.T
     seat_counts: dict[str, np.ndarray] = {}
     chamber_rows = []
@@ -783,7 +1204,7 @@ def run_election_night(
             row[f"P({label})"] = float((counts >= thr).mean())
         chamber_rows.append(row)
 
-    e_i, s_i = model.index("E"), model.index("skew")
+    e_i, s_i, d_i = model.index("E"), model.index("skew"), model.index("delta")
     return ElectionNightResult(
         as_of=pd.Timestamp.now(),
         environment=(float(m[e_i]), float(np.sqrt(P[e_i, e_i]))),
@@ -792,8 +1213,11 @@ def run_election_night(
         races=races_df,
         chambers=pd.DataFrame(chamber_rows),
         seat_counts=seat_counts,
-        n_observations=len(observations),
+        n_observations=len(observations) + (len(fo.y) if fo is not None else 0),
         warnings=warnings,
+        absentee_gap=(float(m[d_i]), float(np.sqrt(P[d_i, d_i]))),
+        outstanding=_outstanding_table(model, fo, sim, feed) if fo is not None else None,
+        feed=feed_meta,
     )
 
 
@@ -811,6 +1235,9 @@ def write_outputs(result: ElectionNightResult, out_dir: Path = OUT_DIR) -> dict[
     }
     result.races.to_csv(paths["races"], index=False, float_format="%.4f")
     result.chambers.to_csv(paths["chambers"], index=False, float_format="%.4f")
+    if result.outstanding is not None:
+        paths["outstanding"] = out_dir / "latest_outstanding.csv"
+        result.outstanding.to_csv(paths["outstanding"], index=False, float_format="%.4f")
 
     sw = result.races[result.races["office"] == "statewide"].set_index("race_id")
     hist = {
@@ -819,6 +1246,8 @@ def write_outputs(result: ElectionNightResult, out_dir: Path = OUT_DIR) -> dict[
         "environment": result.environment[0],
         "environment_sd": result.environment[1],
         "skew": result.skew[0],
+        "absentee_gap": result.absentee_gap[0],
+        "feed_generated": result.feed["generated"].isoformat() if result.feed else "",
         **{f"wp_{rid.split(':')[1]}": sw.loc[rid, "win_prob"] for rid in sw.index},
         **{f"seats_{r.office}": r.mean_d_seats for r in result.chambers.itertuples()},
     }

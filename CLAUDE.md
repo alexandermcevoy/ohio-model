@@ -81,8 +81,12 @@ python cli.py multi report                     # generate summary PDFs for all 3
 python cli.py election-night                   # all races: statewide, House, Senate, US House
 python cli.py election-night --office house    # one chamber in full (also senate/congress election-night)
 python cli.py election-night --early-skew 4    # prior: first-counted ballots run 4 pts D of final
-# Returns go in data/raw/live_returns_oh_{statewide,house,senate,congress}.csv,
+python cli.py election-night --feed --watch 180 # Ohio SOS live feed, refresh every 3 min
+python cli.py election-night --feed-file X.xml # replay a saved feed file
+python cli.py election-night-rehearsal --target 0.505 --gap 15   # replay 2022 through the feed format
+# Manual fallback: data/raw/live_returns_oh_{statewide,house,senate,congress}.csv,
 # or the Streamlit "Election Night" page (same files, same computation).
+# Night-of checklist: ELECTION_NIGHT.md
 
 # Individual modules can be imported and called independently:
 python -c "from src.ingest_sos import load_sos_file; f = load_sos_file('data/raw/statewide-races-by-precinct.xlsx')"
@@ -1075,6 +1079,22 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - **GUI**: `pages/7_Election_Night.py` (enter returns → Save & recompute → projection, seat histograms, history). The `Streamlit (system python)` launch config runs on port 8502 because `python3` on PATH lacks the project's packages. Editor widget keys carry a version that bumps on every Save and on "Reload from files", so typed edits are never re-applied over newer CSV contents (verified: a hand edit to the CSV survives Reload + Save).
 - **Prior date**: `prior_as_of()` = min(today, `ELECTION_DAY` 2026-11-03), so the prior doesn't shift at midnight during the count.
 - **Verified 2026-10-29**: (1) every race final → seat std 0 in each chamber, mean = entered D winners + fixed D. (2) False-call stress test, 30 trials per scenario, truths drawn from the prior, every race at 10–40% reporting: wrong ≥99% calls among races not already ≥99% pre-election were 0.22% (true skew 0), 0.00% (+10 pts), 0.75% (+10, half the races reporting), 0.35% (−10), 0.48% (+10 with 1.5× geographic noise). Under 1% in every case, so `TAU_SCALE`/`CALL_THRESHOLD` were left as is. Small n; a diagnostic, not a calibration.
+
+### SOS live feed + county layer (2026-10-29)
+
+Election night reads the Ohio SOS live results feed instead of hand entry. `src/enr_feed.py` downloads and parses it (NIST 1500-100 XML, `https://liveresults.ohiosos.gov/Api/v1/download?filename=VSSC1622XmlFileBlob`, about every 3 min). Every race comes county by county: 6 statewide, US Senate, 15 CDs, 17 Senate, 99 House. Each of the 88 county reporting units has precincts reported/total, registered voters, ballots cast (total + absentee) and a count status. There's no per-candidate vote-type split. Feed quirks: there are 176 `Type="County"` units, and only those with `TotalSubUnits` are reporting units. Parties come from Party/Name, ticket running mates are `_CO…` ids, and `GeneratedDate` is on a 12-hour clock with no AM/PM (resolved against the download time). Files are saved to `data/raw/enr/enr_YYYYmmdd_HHMMSS.xml`; the last good file is kept if a fetch fails or returns an older file. As of 10/29 the live file is the SOS mock election (IsTest, zero counts); test data triggers a loud banner.
+
+`src/county_layer.py` holds the county inputs (cached in `data/processed/county_layer.parquet`, `county_district_pieces.parquet`). County lean comes from `build_composite_from_blocks` on the county map (same DEFAULT_WEIGHTS), centered on the 2022 turnout weights. County deviation sd is σ_u = 1.9 pts, shared by every race in the county. Race×county sd is σ_v: gov 1.25, uss 1.3, row offices 0.87. All are vote-weighted from 2018–2024. The 2022 governor two-party vote is used as the turnout base per county and per district×county piece.
+
+In `src/election_night.py` (now 758 states), county c's share in statewide race r = E + dev_r + const_r + lean_c + u_c + v_{c,r}. u and v are **centered** (turnout-weighted sum 0), so with nothing counted every statewide race keeps exactly its published mean and variance (parity verified: Acton 64%, Brown 75%, House 40.1). Each county×race observation also loads on Δ, the absentee-minus-Election-Day gap (prior +10 ± 8 pts), via (absentee share of counted ballots − expected final absentee share). It carries composition noise that is shared by all races in that county. District observations use the same Δ logic, with expected votes summed over the district×county pieces. The statewide result is Σ N_c·share_c / Σ N_c, simulated with turnout uncertainty. N_c = 2022 base × statewide factor g, learned from counties with ≥50% of precincts in, after which a county's own precinct extrapolation takes over. 2% of the vote stays outstanding after 100% of precincts. Call guard: no CALL unless |counted margin| ≥ 0.3 × expected outstanding. Uncontested races come from the feed's candidate list (2026: HD 2, 4, 20, 22, 24, 25, 38, 64, 97). The county→district link (districts loading on their counties' u) was deferred: every district reports its own count at the same moments, so it adds little.
+
+Rehearsal (`src/feed_rehearsal.py`, `election-night-rehearsal`) replays 2022 county results, shifted to a target governor share, through the real XML. Absentee shares and the gap are synthetic; release order is absentee first, urban counties last. Results:
+- **Calls:** 36 scenarios (governor targets 47–52%, gap 5/10/20, 3 release orders), 29,496 CALLs, **0 wrong**. Legislative truth there tracks composite lean exactly, so it's easier than real races. A Franklin-only absentee drop never calls the governor.
+- **80% coverage by share counted (statewide):** ≤20%: 34%, 20–60%: 99%, >60%: 100%. The first-batch miss comes from the replay, not the model. Shifting 2022 to a 47–52% governor puts the true environment at 50–55% (Whaley ran 3.2 pts behind the 2022 ticket), 1–3σ above the 48.4% prior. With only absentee ballots counted, the environment and the absentee gap are confounded, so the model leans on its prior until Election Day votes arrive.
+- **Truths drawn from the prior** (16 draws): 80% coverage 84% at ~12% counted, 79% at ~40%, 100% at ~62%. Brier 0.11 / 0.03 / 0.01.
+- **Takeaway:** first-hour ranges are reliable only if the night lands near the forecast.
+- `COUNTY_GAP_SD` (4.5 pts, county-to-county variation in the absentee gap) was set before measuring coverage and not tuned.
+- **Fallback when the feed has no absentee counts** (warning printed; uses the generic early-count skew): no wrong calls, but statewide ranges are biased ~2 pts at 20–60% counted (coverage 0%). Treat it as a degraded mode. The feed self-check line shows whether absentee counts are populated.
 
 ### Headline numbers: Polling Average + Win Likelihood (2026-10-29)
 

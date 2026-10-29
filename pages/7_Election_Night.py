@@ -16,6 +16,7 @@ import streamlit as st
 
 from gui.styles import HOLDER_COLORS, fmt_pct
 from src import election_night as en
+from src import enr_feed
 from src.headlines import statewide_headlines
 from src.office import get_office
 
@@ -40,6 +41,10 @@ with st.sidebar:
         help="Expected D lean of the first ballots counted (early/absentee), relative to the final "
              "result. The model also estimates this from the returns; this is only its starting point.",
     )
+    source = st.radio("Results source", ["SOS live feed", "Manual entry only"], index=0,
+                      help="The SOS feed covers every race county by county and wins over manual entries "
+                           "for any race it has data for.")
+    refresh = source == "SOS live feed" and st.button("Refresh feed now", type="primary")
     n_sims = st.select_slider("Simulations", options=[2_000, 5_000, 10_000], value=5_000)
     with_incumbency = st.checkbox("Literature incumbency adjustment", value=False)
 
@@ -129,21 +134,39 @@ with entry:
 # Projection
 # ---------------------------------------------------------------------------
 
+snap, feed_msgs = None, []
+if source == "SOS live feed":
+    snap, feed_msgs = enr_feed.load_latest(fetch=bool(refresh))
 try:
-    result = en.run_election_night(model, n_sims=n_sims)
+    result = en.run_election_night(model, feed=snap, n_sims=n_sims)
 except ValueError as exc:
     projection.error(f"Problem in the entered returns: {exc}")
     st.stop()
-if st.session_state.pop("en_saved", False):
+if st.session_state.pop("en_saved", False) or refresh:
     en.write_outputs(result)
 
 races = result.races
 
 with projection:
-    st.caption(f"As of {result.as_of:%H:%M:%S} · {result.n_observations} race(s) with returns entered · "
-               f"{int(races['is_final'].sum())} fully counted")
+    if source == "SOS live feed":
+        if snap is None:
+            st.info("No SOS feed file saved yet. Click **Refresh feed now** in the sidebar.")
+        else:
+            gen = pd.Timestamp(snap.generated)
+            gen = gen.tz_convert("America/New_York") if gen.tzinfo else gen
+            if snap.is_test:
+                st.error("TEST / MOCK FEED — the SOS file is marked as test data. These are not real results.")
+            st.caption(f"SOS feed generated {gen:%H:%M:%S} ET · {snap.source.name if snap.source else ''} · "
+                       f"turnout vs 2022: {result.feed['g'][0]:.2f} ± {result.feed['g'][1]:.2f}  \n"
+                       f"{result.feed['self_check']}")
+    for m in feed_msgs:
+        st.warning(m)
+    n_races = int(races["live_dem_votes"].notna().sum())
+    st.caption(f"As of {result.as_of:%H:%M:%S} · {n_races} race(s) with votes counted · "
+               f"{int(races['is_final'].sum())} marked final")
     for w in result.warnings:
-        st.warning(w)
+        if "TEST/MOCK" not in w:
+            st.warning(w)
 
     st.subheader("Statewide races")
     st.caption("Polling average = weighted raw poll toplines; its 80% range is where the final margin lands 4 times "
@@ -165,14 +188,39 @@ with projection:
         e, e_sd = result.environment
         e0, _ = result.environment_prior
         s, s_sd = result.skew
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Environment (generic statewide race)", f"{e:.1%}",
                   f"±{e_sd * 100:.1f} · {(e - e0) * 100:+.1f} pts vs. pre-election", delta_color="off")
-        c2.metric("Early-count skew", f"{s * 100:+.1f} pts", f"±{s_sd * 100:.1f} pts", delta_color="off")
+        c2.metric("Early-count skew (manual entries)", f"{s * 100:+.1f} pts", f"±{s_sd * 100:.1f} pts", delta_color="off")
+        gap, gap_sd = result.absentee_gap
+        c3.metric("Absentee vs Election Day gap (feed)", f"{gap * 100:+.1f} pts", f"±{gap_sd * 100:.1f} pts", delta_color="off")
         st.caption("The environment is the Democratic share of a generic statewide race (the average of "
                    "AG/Auditor/SOS/Treasurer) with no candidates attached. Every projection is built on it; "
                    "it is not any real race's vote share. Early-count skew is how far the first-counted "
                    "ballots lean D relative to the final count.")
+
+    if result.outstanding is not None:
+        o = result.outstanding
+        st.subheader("Outstanding vote — Governor")
+        st.caption(f"About {o['remaining_votes'].sum():,.0f} two-party votes left; projected to net Acton "
+                   f"{o['remaining_net_d'].sum():+,.0f}. Expected votes come from 2022 turnout scaled by the night's "
+                   "turnout so far, or from a county's own precincts once half are in. Late absentee and "
+                   "provisional ballots are counted as still outstanding even at 100% of precincts.")
+        st.dataframe(
+            o[["name", "precinct_frac", "counted_votes", "expected_votes", "remaining_votes",
+               "counted_d_share", "remaining_d_share", "remaining_net_d"]].head(25),
+            hide_index=True, width="stretch",
+            column_config={
+                "name": "County",
+                "precinct_frac": st.column_config.ProgressColumn("Precincts in", min_value=0.0, max_value=1.0, format="percent"),
+                "counted_votes": st.column_config.NumberColumn("Counted", format="localized"),
+                "expected_votes": st.column_config.NumberColumn("Expected", format="localized"),
+                "remaining_votes": st.column_config.NumberColumn("Left", format="localized"),
+                "counted_d_share": st.column_config.NumberColumn("Counted D", format="percent"),
+                "remaining_d_share": st.column_config.NumberColumn("Left D (proj.)", format="percent"),
+                "remaining_net_d": st.column_config.NumberColumn("Left net D", format="%+d"),
+            },
+        )
 
     st.subheader("Chambers")
     chamber_cols = st.columns(3)

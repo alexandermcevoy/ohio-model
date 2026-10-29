@@ -3827,13 +3827,25 @@ def _fmt_pct(x, digits: int = 1) -> str:
 def _print_election_night(result, focus: str | None = None, n_close: int = 10, details: bool = False) -> None:
     """Terminal dashboard. focus=None prints every office; otherwise one chamber in full."""
     import math
+    import pandas as pd
     from src.headlines import statewide_headlines
     from src.office import get_office
 
     races = result.races
     typer.echo(f"=== Ohio Election Night — {result.as_of:%Y-%m-%d %H:%M:%S} ===\n")
+    if result.feed:
+        fd = result.feed
+        gen = pd.Timestamp(fd["generated"]).tz_convert("America/New_York") if pd.Timestamp(fd["generated"]).tzinfo \
+            else pd.Timestamp(fd["generated"])
+        typer.echo(f"  SOS feed generated {gen:%H:%M:%S} ET · {Path(fd['file']).name if fd['file'] else ''}"
+                   f" · turnout vs 2022: {fd['g'][0]:.2f} ± {fd['g'][1]:.2f}")
+        if fd["is_test"]:
+            typer.echo("  ##############  TEST / MOCK FEED — NOT REAL RESULTS  ##############")
+        if fd.get("self_check"):
+            typer.echo(f"  {fd['self_check']}")
     n_final = int(races["is_final"].sum())
-    typer.echo(f"  Returns in: {result.n_observations} race(s) with partial counts ({n_final} fully counted)")
+    n_races = int(races["live_dem_votes"].notna().sum())
+    typer.echo(f"  Returns in: {n_races} race(s) with votes counted ({n_final} marked final)")
     for w in result.warnings:
         typer.echo(f"  ⚠ {w}")
     if details:
@@ -3843,11 +3855,27 @@ def _print_election_night(result, focus: str | None = None, n_close: int = 10, d
         typer.echo(
             f"  Model internals — environment (generic statewide race): {_fmt_pct(e)} ± {_fmt_pct(e_sd)}"
             f" [pre-election {_fmt_pct(e0)} ± {_fmt_pct(e0_sd)}];"
-            f" early-count skew {s * 100:+.1f} ± {s_sd * 100:.1f} pts at 0% reporting"
+            f" early-count skew {s * 100:+.1f} ± {s_sd * 100:.1f} pts at 0% reporting;"
+            f" absentee gap {result.absentee_gap[0] * 100:+.1f} ± {result.absentee_gap[1] * 100:.1f} pts"
         )
     typer.echo()
 
     _print_statewide_headlines(statewide_headlines(result), live=True)
+
+    if result.outstanding is not None:
+        o = result.outstanding
+        rem = float(o["remaining_votes"].sum())
+        net = float(o["remaining_net_d"].sum())
+        typer.echo(f"  OUTSTANDING VOTE (Governor): ~{rem:,.0f} two-party votes left; "
+                   f"projected to net Acton {net:+,.0f}")
+        typer.echo(f"    {'County':<12} {'Prec in':>7} {'Counted':>10} {'Expected':>10} {'Left':>9}"
+                   f" {'Counted D%':>10} {'Left D%':>8} {'Left net D':>11}")
+        for r in o.head(12).itertuples():
+            cd = "—" if pd.isna(r.counted_d_share) else f"{r.counted_d_share:.1%}"
+            ld = "—" if pd.isna(r.remaining_d_share) else f"{r.remaining_d_share:.1%}"
+            typer.echo(f"    {r.name:<12} {r.precinct_frac:>7.0%} {r.counted_votes:>10,.0f} {r.expected_votes:>10,.0f}"
+                       f" {r.remaining_votes:>9,.0f} {cd:>10} {ld:>8} {r.remaining_net_d:>+11,.0f}")
+        typer.echo()
 
     offices = [focus] if focus else ["house", "senate", "congress"]
     typer.echo("  CHAMBERS (D seats)")
@@ -3898,14 +3926,24 @@ def _run_election_night(
     seed: int = 42,
     write: bool = True,
     details: bool = False,
+    feed: bool = False,
+    feed_file: Path | None = None,
+    fetch: bool = True,
+    watch: int = 0,
 ):
     """
-    Read the live-returns CSVs under data/raw/, condition the joint pre-election
-    model for every Ohio race on them (src/election_night.py), and print the
-    projection. Rerun after each edit; there is no polling loop.
+    Condition the joint pre-election model for every Ohio race
+    (src/election_night.py) on the current returns and print the projection.
+
+    Returns come from the Ohio SOS live feed (--feed: download the newest file;
+    --no-fetch: reuse the last saved one; --feed-file: a specific file) and/or
+    the manual CSVs under data/raw/. The feed wins for every race it covers.
+    --watch N repeats every N seconds.
     """
+    import time
     import pandas as pd
     from src import election_night as en
+    from src import enr_feed
 
     changed = en.ensure_return_files()
     for p in changed:
@@ -3915,20 +3953,35 @@ def _run_election_night(
     if early_skew is not None:
         kwargs["early_skew_mean"] = early_skew / 100
     model = en.build_prior_model(en.prior_as_of(), **kwargs)
-    try:
-        result = en.run_election_night(model, n_sims=n_sims, seed=seed)
-    except ValueError as exc:
-        typer.echo(f"ERROR in live returns: {exc}", err=True)
-        raise typer.Exit(1)
 
-    _print_election_night(result, focus=focus, details=details)
-    if write:
-        paths = en.write_outputs(result)
-        typer.echo("  → " + "   ".join(str(p) for p in paths.values()))
+    while True:
+        snap = None
+        if feed_file is not None:
+            snap = enr_feed.parse_feed(feed_file)
+        elif feed:
+            snap, msgs = enr_feed.load_latest(fetch=fetch)
+            for msg in msgs:
+                typer.echo(f"  ⚠ {msg}")
+            if snap is None:
+                typer.echo("  ⚠ No SOS feed file available; using manual entries only.")
+        try:
+            result = en.run_election_night(model, feed=snap, n_sims=n_sims, seed=seed)
+        except ValueError as exc:
+            typer.echo(f"ERROR in live returns: {exc}", err=True)
+            raise typer.Exit(1)
+
+        _print_election_night(result, focus=focus, details=details)
+        if write:
+            paths = en.write_outputs(result)
+            typer.echo("  → " + "   ".join(str(p) for p in paths.values()))
+        if not watch:
+            break
+        typer.echo(f"\n  Next refresh in {watch}s (Ctrl-C to stop)\n")
+        time.sleep(watch)
     typer.echo(
-        "\n  Enter returns in data/raw/live_returns_oh_{statewide,house,senate,congress}.csv "
-        "(or the Election Night dashboard page). pct_reporting = the source's % of expected vote "
-        "counted; is_final = every vote counted. Not a substitute for AP/network calls."
+        "\n  Sources: the SOS live feed with --feed (every race, county by county), and/or manual entries in "
+        "data/raw/live_returns_oh_{statewide,house,senate,congress}.csv or the Election Night page. "
+        "Not a substitute for AP/network calls."
     )
 
 
@@ -3941,6 +3994,10 @@ _EN_SKEW = typer.Option(
 _EN_SEED = typer.Option(42, "--seed")
 _EN_WRITE = typer.Option(True, "--write/--no-write", help="Write reports/election_night/ outputs")
 _EN_DETAILS = typer.Option(False, "--details", help="Also show model internals (environment, early-count skew)")
+_EN_FEED = typer.Option(False, "--feed", help="Use the Ohio SOS live results feed (downloads the newest file)")
+_EN_FEED_FILE = typer.Option(None, "--feed-file", help="Use this saved SOS feed XML instead of downloading")
+_EN_FETCH = typer.Option(True, "--fetch/--no-fetch", help="With --feed: download a new file, or reuse the last saved one")
+_EN_WATCH = typer.Option(0, "--watch", help="Repeat every N seconds (with --feed, re-downloads each time)")
 
 
 @app.command("election-night")
@@ -3951,12 +4008,13 @@ def election_night_all(
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
     details: bool = _EN_DETAILS,
+    feed: bool = _EN_FEED, feed_file: Path = _EN_FEED_FILE, fetch: bool = _EN_FETCH, watch: int = _EN_WATCH,
 ):
     """Live projection for every Ohio race from manually entered returns. Also `house election-night`."""
     if office not in (None, "house", "senate", "congress"):
         typer.echo("--office must be house, senate or congress", err=True)
         raise typer.Exit(1)
-    _run_election_night(office, n_sims, with_incumbency, early_skew, seed, write, details)
+    _run_election_night(office, n_sims, with_incumbency, early_skew, seed, write, details, feed, feed_file, fetch, watch)
 
 
 @senate_app.command("election-night")
@@ -3964,9 +4022,10 @@ def senate_election_night(
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
     details: bool = _EN_DETAILS,
+    feed: bool = _EN_FEED, feed_file: Path = _EN_FEED_FILE, fetch: bool = _EN_FETCH, watch: int = _EN_WATCH,
 ):
     """Election-night projection, Ohio State Senate in full (same joint model)."""
-    _run_election_night("senate", n_sims, with_incumbency, early_skew, seed, write, details)
+    _run_election_night("senate", n_sims, with_incumbency, early_skew, seed, write, details, feed, feed_file, fetch, watch)
 
 
 @congress_app.command("election-night")
@@ -3974,9 +4033,52 @@ def congress_election_night(
     n_sims: int = _EN_N_SIMS, with_incumbency: bool = _EN_INC,
     early_skew: float = _EN_SKEW, seed: int = _EN_SEED, write: bool = _EN_WRITE,
     details: bool = _EN_DETAILS,
+    feed: bool = _EN_FEED, feed_file: Path = _EN_FEED_FILE, fetch: bool = _EN_FETCH, watch: int = _EN_WATCH,
 ):
     """Election-night projection, Ohio US House in full (same joint model)."""
-    _run_election_night("congress", n_sims, with_incumbency, early_skew, seed, write, details)
+    _run_election_night("congress", n_sims, with_incumbency, early_skew, seed, write, details, feed, feed_file, fetch, watch)
+
+
+@app.command("election-night-rehearsal")
+def election_night_rehearsal(
+    target: float = typer.Option(0.505, "--target", help="True statewide governor D share to replay toward"),
+    gap: float = typer.Option(10.0, "--gap", help="True absentee-minus-Election-Day gap, in points"),
+    steps: int = typer.Option(10, "--steps"),
+    seed: int = typer.Option(0, "--seed"),
+    n_sims: int = typer.Option(3_000, "--n-sims"),
+):
+    """
+    Replay 2022 county results (shifted to --target) through the real SOS feed
+    format, one release at a time: absentee batches first, big urban counties
+    last. Writes each step's XML to data/raw/enr_rehearsal/ so you can also
+    open them with `election-night --feed-file` or step through on the page.
+    """
+    import pandas as pd
+    from src import election_night as en
+    from src import enr_feed
+    from src.feed_rehearsal import build_truth, counts_at, release_schedule, write_step_xml
+    from src.headlines import empty_frames
+
+    template = enr_feed.latest_feed_file()
+    if template is None:
+        template = enr_feed.fetch_feed()
+    out_dir = enr_feed.FEED_DIR.parent / "enr_rehearsal"
+    truth = build_truth("2022", gap=gap / 100, seed=seed, target_gov_share=target)
+    sched = release_schedule(steps, seed=seed)
+    model = en.build_prior_model(en.prior_as_of())
+    typer.echo(f"Rehearsal: true governor D share {target:.1%}, true absentee gap {gap:+.0f} pts\n")
+    typer.echo(f"  {'Step':>4} {'In':>5} {'Live D%':>8} {'Proj D%':>8} {'80% range':>15} {'Acton win':>9}  Call         House D seats")
+    for step in range(steps):
+        c, p, b = counts_at(truth, sched, step)
+        path = write_step_xml(template, out_dir / f"step{step:02d}.xml", c, p, b,
+                              pd.Timestamp("2026-11-04T00:30:00Z") + pd.Timedelta(minutes=20 * step))
+        r = en.run_election_night(model, empty_frames(), feed=enr_feed.parse_feed(path), n_sims=n_sims, seed=step)
+        g = r.races.set_index("race_id").loc["statewide:governor"]
+        house = r.chambers.set_index("office").loc["house"]
+        typer.echo(f"  {step:>4} {g.live_fraction:>5.0%} {g.live_d_share:>8.1%} {g.proj_d_share:>8.1%} "
+                   f"{g.proj_low80:>7.1%}–{g.proj_high80:<7.1%} {g.win_prob:>9.0%}  {g.call:<12} "
+                   f"{house.mean_d_seats:.1f} [{int(house.p10_seats)}, {int(house.p90_seats)}]")
+    typer.echo(f"\n  Step files: {out_dir}/  (try: python cli.py election-night --feed-file {out_dir}/step03.xml)")
 
 
 @multi_app.command("backbone")
