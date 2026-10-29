@@ -1,0 +1,3 @@
+district,year,composite_lean,expected_d_share,actual_d_share,residual,abs_residual,severity,auto_explanation,contested
+19,2022,0.0943,0.5010,0.6197,0.1187,0.1187,moderate,redistricting_artifact,True
+94,2022,-0.1127,0.2939,0.3964,0.1025,0.1025,moderate,redistricting_artifact,True

@@ -30,19 +30,260 @@ from src.composite import (
     DEFAULT_WEIGHTS,
     merge_composite_with_house_results,
 )
-from src.ingest_house_results import (
+from src.ingest_race_results import (
     apply_redistricting_filter,
-    combine_house_results,
+    combine_race_results,
 )
 from src.simulate import (
     SimConfig,
     compute_sigma_prior,
+    compute_shared_sigma,
     estimate_district_sigma,
     compute_analytical_win_probs,
     run_simulations,
 )
 
 REPORTS_DIR = Path("reports/session12")
+
+
+# ---------------------------------------------------------------------------
+# Office-aware backtest helpers (Phase A.10 extension)
+# ---------------------------------------------------------------------------
+
+def build_pre2024_composite_for_office(office) -> pd.DataFrame:
+    """Office-aware variant of build_pre2024_composite.
+
+    Uses the office's block-district map and `office.n_districts` for
+    validation. House continues to use the legacy precinct-crosswalk path
+    via build_pre2024_composite() above for byte-exact regression.
+    """
+    if office.is_statewide:
+        raise ValueError(f"Office '{office.name}' is statewide; backtest not applicable")
+    if office.block_district_map_path is None:
+        raise ValueError(f"Office '{office.name}' has no block-district map")
+
+    plan_label = office.map_plan_label
+    bdm = load_block_district_map(plan_label)
+    return build_composite_from_blocks(
+        years=["2016", "2018", "2020", "2022"],
+        block_district_map=bdm,
+        weights=PRE2024_WEIGHTS,
+    )
+
+
+def load_actual_2024_results_for_office(office) -> pd.DataFrame:
+    """Load 2024 race results for any office from its actual_results CSV."""
+    path = Path(f"reports/session2/{office.output_prefix}_actual_results.csv")
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found. Run `{office.name} composite` first.")
+    df = pd.read_csv(path)
+    return df[df["year"] == 2024].copy()
+
+
+def build_pre2024_race_history_for_office(office) -> pd.DataFrame:
+    """Load pre-2024 race results for any office, filtered for redistricting where applicable."""
+    path = Path(f"reports/session2/{office.output_prefix}_actual_results.csv")
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found. Run `{office.name} composite` first.")
+    df = pd.read_csv(path)
+    df_pre = df[df["year"] < 2024].copy()
+
+    # Only the house has a precinct-level redistricting overlap CSV.
+    if office.name == "house":
+        overlap_path = Path("reports/redistricting_overlap.csv")
+        if overlap_path.exists():
+            overlap = pd.read_csv(overlap_path)
+            df_pre, _ = apply_redistricting_filter(df_pre, overlap)
+    return df_pre
+
+
+def run_backtest_for_office(office) -> dict:
+    """Generalized backtest: pre-2024 composite + actual 2024 outcomes.
+
+    Senate is fully supported (Sept 2023 SD plan covers both 2024 and 2026
+    elections). Congress per-district backtest is NOT valid because the
+    current composite is on the NEW Oct 31, 2025 plan, while 2024 elections
+    used the prior 15-CD map; aggregate seat count comparisons are limited.
+    The function still runs for congress but the result dict carries a
+    `geometry_caveat` flag.
+    """
+    print("=" * 60)
+    print(f"BACKTEST [{office.display_name}]: Pre-2024 -> 2024 Predictions")
+    print("=" * 60)
+
+    composite_pre = build_pre2024_composite_for_office(office)
+    print(f"\n  Composite built for {len(composite_pre)} districts "
+          f"(office.n_districts = {office.n_districts})")
+
+    actual_2024 = load_actual_2024_results_for_office(office)
+    print(f"  2024 actual races: {len(actual_2024)} "
+          f"(senate even-only is expected for senate)")
+
+    pre_long = build_pre2024_race_history_for_office(office)
+    print(f"  Pre-2024 race rows: {len(pre_long)}")
+
+    # Combine pre-2024 results into wide format for candidate effects.
+    pre_list = [pre_long[pre_long["year"] == y] for y in pre_long["year"].unique()]
+    pre_wide = combine_race_results(pre_list) if pre_list else pd.DataFrame({"district": []})
+
+    all_baselines = json.loads(Path("data/processed/year_baselines.json").read_text())
+    baselines_pre = {k: v for k, v in all_baselines.items() if k != "2024"}
+    available_years = sorted(pre_long["year"].unique().astype(str)) if len(pre_long) else []
+
+    composite_with_effects = merge_composite_with_house_results(
+        composite_pre, pre_wide, available_years, baselines_pre,
+    )
+
+    sigma_prior = compute_sigma_prior(composite_with_effects)
+    print(f"  Sigma prior (within-year): {sigma_prior:.4f}  |  shared year sigma: "
+          f"{compute_shared_sigma(composite_with_effects):.4f}")
+
+    _scratch = compute_swing_metrics(composite_pre.copy(), pre_long)
+    sigma_df = estimate_district_sigma(
+        _scratch, sigma_prior,
+        sigma_shared=compute_shared_sigma(composite_with_effects),
+    )
+
+    # Targeting-like DF.
+    winners = actual_2024[["district", "winner"]].rename(columns={"winner": "winner_2024"})
+    targeting_pre = composite_pre.merge(winners, on="district", how="left")
+    targeting_pre = classify_districts(targeting_pre, sigma_df=sigma_df)
+    targeting_pre = compute_swing_metrics(targeting_pre, pre_long)
+    targeting_pre["flip_threshold"] = (0.50 - targeting_pre["composite_lean"]).round(4)
+    targeting_pre["incumbent_status_2026"] = "unknown"
+
+    statewide_d_2024 = all_baselines["2024"]
+    print(f"\n  Predicting at statewide D = {statewide_d_2024*100:.2f}%")
+
+    wp_df = compute_analytical_win_probs(targeting_pre, sigma_df, statewide_d_2024)
+    config = SimConfig(n_sims=10_000, random_seed=42)
+    sim_result = run_simulations(targeting_pre, sigma_df, statewide_d_2024, config)
+
+    # Restrict eval to districts that actually appear in 2024 results
+    # (senate: 16 even districts; congress: all 15; house: all 99).
+    wp_renamed = wp_df.rename(columns={"margin": "predicted_margin"})
+    eval_df = wp_renamed.merge(
+        actual_2024[["district", "winner", "contested", "dem_share", "margin"]],
+        on="district", how="inner",
+    )
+    eval_df["actual_d_win"] = eval_df["winner"].str.startswith("D").fillna(False)
+    eval_df = eval_df.merge(
+        targeting_pre[["district", "tier", "flip_threshold", "n_contested", "swing_sd"]],
+        on="district", how="left",
+    )
+
+    # Build a slimmer accuracy summary; skip MC seat CI for senate
+    # (only half the chamber is up — total seats not directly comparable).
+    n_eval = len(eval_df)
+    eval_df["predicted_d"] = eval_df["win_prob"] > 0.5
+    eval_df["correct"] = eval_df["predicted_d"] == eval_df["actual_d_win"]
+    overall_accuracy = float(eval_df["correct"].mean()) if n_eval else float("nan")
+    contested = eval_df[eval_df["contested"]].copy()
+    contested["correct"] = contested["predicted_d"] == contested["actual_d_win"]
+    contested_accuracy = float(contested["correct"].mean()) if len(contested) else float("nan")
+
+    actual_d_seats = int(eval_df["actual_d_win"].sum())
+    expected_d = float(eval_df["win_prob"].sum())
+
+    brier = float(((eval_df["win_prob"] - eval_df["actual_d_win"].astype(float)) ** 2).mean())
+    if len(contested):
+        brier_contested = float(((contested["win_prob"] - contested["actual_d_win"].astype(float)) ** 2).mean())
+        brier_naive = float(((0.5 - contested["actual_d_win"].astype(float)) ** 2).mean())
+        brier_skill = 1 - brier_contested / brier_naive if brier_naive > 0 else float("nan")
+    else:
+        brier_contested = brier_skill = float("nan")
+
+    geometry_caveat = (office.name == "congress")
+
+    print(f"\n  Districts evaluated:        {n_eval}")
+    print(f"  Binary accuracy (all eval): {overall_accuracy:.1%} ({eval_df['correct'].sum()}/{n_eval})")
+    print(f"  Contested accuracy:         {contested_accuracy:.1%} "
+          f"({contested['correct'].sum() if len(contested) else 0}/{len(contested)})")
+    print(f"  Actual D seats (in eval):   {actual_d_seats}")
+    print(f"  Expected D seats (sum WP):  {expected_d:.2f}")
+    print(f"  Brier (all eval):           {brier:.4f}")
+    if not np.isnan(brier_skill):
+        print(f"  Brier skill score:          {brier_skill:.4f}")
+    if geometry_caveat:
+        print("\n  WARNING [congress]: composite_lean is on the NEW Oct 2025 CD map; "
+              "2024 actual results are on the prior map. Per-district matching by "
+              "district number is NOT geometrically valid. Treat as illustrative.")
+
+    return {
+        "office": office.name,
+        "n_eval": n_eval,
+        "overall_accuracy": overall_accuracy,
+        "contested_accuracy": contested_accuracy,
+        "actual_d_seats": actual_d_seats,
+        "expected_d_seats": expected_d,
+        "brier": brier,
+        "brier_contested": brier_contested,
+        "brier_skill": brier_skill,
+        "statewide_d_2024": statewide_d_2024,
+        "geometry_caveat": geometry_caveat,
+        "eval_df": eval_df,
+        "sigma_df": sigma_df,
+        "sim_result": sim_result,
+    }
+
+
+def write_office_backtest_outputs(office, results: dict) -> Path:
+    """Write per-office backtest CSV + text summary to reports/session12/."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    prefix = office.output_prefix
+
+    eval_df = results["eval_df"].copy()
+    eval_cols = [
+        "district", "composite_lean", "tier", "win_prob", "predicted_margin",
+        "sigma_i", "actual_d_win", "winner", "contested", "dem_share",
+        "margin", "predicted_d", "correct",
+    ]
+    available = [c for c in eval_cols if c in eval_df.columns]
+    eval_path = REPORTS_DIR / f"{prefix}_backtest_district_predictions.csv"
+    eval_df[available].sort_values("district").to_csv(eval_path, index=False, float_format="%.6f")
+
+    summary_path = REPORTS_DIR / f"{prefix}_backtest_summary.txt"
+    lines = [
+        "=" * 70,
+        f"BACKTEST [{office.display_name}]: Pre-2024 -> 2024 Predictions",
+        "=" * 70,
+        "",
+        f"Office:                    {office.display_name}",
+        f"Districts evaluated:       {results['n_eval']} of {office.n_districts}",
+        f"Statewide D (2024):        {results['statewide_d_2024']*100:.2f}%",
+        "",
+        f"Binary accuracy (all):     {results['overall_accuracy']:.1%}",
+        f"Contested accuracy:        {results['contested_accuracy']:.1%}",
+        f"Actual D seats (in eval):  {results['actual_d_seats']}",
+        f"Expected D seats (sum WP): {results['expected_d_seats']:.2f}",
+        f"Brier (all eval):          {results['brier']:.4f}",
+        f"Brier (contested):         {results['brier_contested']:.4f}",
+        f"Brier skill score:         {results['brier_skill']:.4f}",
+    ]
+    if results["geometry_caveat"]:
+        lines += [
+            "",
+            "GEOMETRY CAVEAT",
+            "-" * 70,
+            "  Congress composite_lean is on the NEW Oct 31, 2025 plan. 2024 actual",
+            "  results are on the prior (2022-2024) plan. District numbers do not",
+            "  refer to the same geographic constituency across the two maps. This",
+            "  backtest is ILLUSTRATIVE ONLY and should not be cited as predictive",
+            "  validation. Acquiring the prior CD shapefile would unblock a valid",
+            "  per-district backtest.",
+        ]
+    if office.name == "senate":
+        lines += [
+            "",
+            "SENATE NOTE",
+            "-" * 70,
+            "  Only even-numbered districts (16 of 33) are on the 2024 ballot due to",
+            "  staggered terms. Backtest evaluates predictions for those 16 only;",
+            "  the chamber-wide MC seat distribution from `senate simulate` is not",
+            "  directly comparable to 2024 outcome (only half the chamber was up).",
+        ]
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path
 
 # Exclude 2024 races, keep relative proportions of 2016-2022 races.
 # build_composite() handles weight normalization automatically.
@@ -53,7 +294,7 @@ PRE2024_WEIGHTS: dict[tuple[str, str], float] = {
 
 def build_pre2024_composite() -> pd.DataFrame:
     """Build composite lean using only 2016-2022 block vote surfaces."""
-    bdm = load_block_district_map("2024")
+    bdm = load_block_district_map("house_2024")
     return build_composite_from_blocks(
         years=["2016", "2018", "2020", "2022"],
         block_district_map=bdm,
@@ -134,7 +375,7 @@ def run_backtest() -> dict:
     house_pre_list = [
         house_pre[house_pre["year"] == y] for y in house_pre["year"].unique()
     ]
-    house_wide_pre = combine_house_results(house_pre_list)
+    house_wide_pre = combine_race_results(house_pre_list)
 
     all_baselines = json.loads(
         Path("data/processed/year_baselines.json").read_text()
@@ -148,11 +389,15 @@ def run_backtest() -> dict:
 
     # Estimate district uncertainty from pre-2024 data
     sigma_prior = compute_sigma_prior(composite_with_effects)
-    print(f"  Sigma prior (pre-2024 candidate effects): {sigma_prior:.4f}")
+    print(f"  Sigma prior (pre-2024, within-year): {sigma_prior:.4f}  |  shared year sigma: "
+          f"{compute_shared_sigma(composite_with_effects):.4f}")
 
     # Need swing metrics for sigma estimation — compute on a scratch copy first
     _scratch = compute_swing_metrics(composite_pre.copy(), house_pre)
-    sigma_df = estimate_district_sigma(_scratch, sigma_prior)
+    sigma_df = estimate_district_sigma(
+        _scratch, sigma_prior,
+        sigma_shared=compute_shared_sigma(composite_with_effects),
+    )
     print(f"  Sigma range: {sigma_df['sigma_i'].min():.4f} - "
           f"{sigma_df['sigma_i'].max():.4f}")
 

@@ -49,7 +49,17 @@ class SimConfig:
 
 @dataclass
 class SimResult:
-    """Container for simulation outputs at a single statewide environment."""
+    """
+    Container for simulation outputs.
+
+    `statewide_d` is always a float — the fixed environment for a point
+    simulation, or the mean of `environment_samples` when the environment
+    itself was drawn from a distribution (see `run_simulations`).
+    `environment_samples` is None for a point simulation and holds the raw
+    per-simulation environment draws otherwise (e.g. from
+    `national_to_state.build_environment_prior()`), so a caller can recover
+    the full input distribution, not just its mean.
+    """
 
     statewide_d: float
     n_sims: int
@@ -68,40 +78,121 @@ class SimResult:
     p90_seats: int
     std_seats: float
 
+    # None for a point simulation; the raw per-simulation environment draws
+    # (e.g. from national_to_state.build_environment_prior()) otherwise.
+    environment_samples: np.ndarray | None = None
+
 
 # ---------------------------------------------------------------------------
 # District uncertainty estimation (Empirical Bayes shrinkage)
 # ---------------------------------------------------------------------------
 
-def compute_sigma_prior(composite_lean_df: pd.DataFrame) -> float:
-    """
-    Compute the statewide prior for district-level outcome noise.
-
-    Uses pooled std of candidate_effect across all contested district-years.
-    Falls back to a conservative default (0.06) if insufficient data.
-    """
-    effect_cols = [c for c in composite_lean_df.columns if c.startswith("candidate_effect_")]
-    contested_cols = [c for c in composite_lean_df.columns if c.startswith("contested_")]
-
-    effects = []
-    for ecol in effect_cols:
+def _candidate_effects_by_year(composite_lean_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Contested candidate effects per year, from candidate_effect_{year} columns."""
+    by_year: dict[str, np.ndarray] = {}
+    for ecol in composite_lean_df.columns:
+        if not ecol.startswith("candidate_effect_"):
+            continue
         year = ecol.replace("candidate_effect_", "")
         ccol = f"contested_{year}"
-        if ccol in composite_lean_df.columns:
-            mask = composite_lean_df[ccol].fillna(False)
-            vals = composite_lean_df.loc[mask, ecol].dropna()
-            effects.extend(vals.tolist())
+        if ccol not in composite_lean_df.columns:
+            continue
+        mask = composite_lean_df[ccol].fillna(False).astype(bool)
+        vals = composite_lean_df.loc[mask, ecol].dropna().to_numpy(dtype=float)
+        if len(vals):
+            by_year[year] = vals
+    return by_year
 
-    if len(effects) < 10:
+
+def candidate_effect_year_summary(composite_lean_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-year n / mean / sd of contested candidate effects (for logging)."""
+    rows = [
+        {"year": y, "n": len(v), "mean": float(v.mean()),
+         "sd": float(v.std(ddof=1)) if len(v) > 1 else float("nan")}
+        for y, v in sorted(_candidate_effects_by_year(composite_lean_df).items())
+    ]
+    return pd.DataFrame(rows, columns=["year", "n", "mean", "sd"])
+
+
+def compute_sigma_prior(composite_lean_df: pd.DataFrame) -> float:
+    """
+    Statewide prior for INDEPENDENT district-level outcome noise.
+
+    Pooled within-year std of contested candidate effects: each year's
+    effects are demeaned by that year's own mean before pooling, so a shift
+    that moves every House race together in one cycle (e.g. 2022, when
+    House Democrats ran well ahead of the statewide reference race) is not
+    counted as district-level noise. That shared component is estimated
+    separately by compute_shared_sigma() and drawn once per simulation.
+
+    Falls back to a conservative default (0.06) if insufficient data.
+    """
+    by_year = {y: v for y, v in _candidate_effects_by_year(composite_lean_df).items() if len(v) >= 2}
+    n_obs = sum(len(v) for v in by_year.values())
+    dof = n_obs - len(by_year)
+    if n_obs < 10 or dof <= 0:
         return 0.06  # conservative fallback
 
-    return float(np.std(effects, ddof=1))
+    ss_within = sum(float(((v - v.mean()) ** 2).sum()) for v in by_year.values())
+    return float(np.sqrt(ss_within / dof))
+
+
+def compute_shared_sigma(composite_lean_df: pd.DataFrame) -> float:
+    """
+    Std of the year-to-year shift shared by every House race: how far House
+    Democrats as a group land from the statewide reference race in a given
+    cycle, beyond what the composite lean predicts.
+
+    tau^2 = var(year means) - mean(sigma_within^2 / n_year), floored at 0.
+    The subtraction removes the sampling noise in each year's mean — the
+    2018/2020 means come from only the ~13 same-geography districts that
+    survive the redistricting filter, so their raw spread overstates tau.
+
+    Returns 0.0 when fewer than two years have >=2 contested effects (tau is
+    not estimable; callers log it).
+
+    Not to be confused with forecast_statewide.MIN_OHIO_SIGMA: that floor
+    covers error in estimating the statewide reference itself (e.g. polling
+    bias shared across Ohio pollsters). This term covers the House's offset
+    from the reference even when the reference is known exactly.
+    """
+    by_year = {y: v for y, v in _candidate_effects_by_year(composite_lean_df).items() if len(v) >= 2}
+    if len(by_year) < 2:
+        return 0.0
+    within = compute_sigma_prior(composite_lean_df)
+    means = np.array([v.mean() for v in by_year.values()])
+    ns = np.array([len(v) for v in by_year.values()], dtype=float)
+    tau2 = float(means.var(ddof=1) - np.mean(within**2 / ns))
+    return float(np.sqrt(max(tau2, 0.0)))
+
+
+def shared_sigma_of(sigma_df: pd.DataFrame) -> float:
+    """
+    The shared (year-level) sigma carried on a sigma_df.
+
+    Raises rather than defaulting to 0 — a sigma_df written before the
+    independent/shared split would otherwise silently produce overconfident
+    win probabilities (the GUI reads a checked-in gui_data/district_sigma.csv).
+    """
+    if "sigma_shared" not in sigma_df.columns:
+        raise KeyError(
+            "sigma_df has no 'sigma_shared' column — it predates the split of "
+            "district noise into independent + shared parts. Regenerate it via "
+            "estimate_district_sigma(..., sigma_shared=compute_shared_sigma(composite_df)) "
+            "(CLI: `session8` / `<office> simulate`, then `export-gui`)."
+        )
+    vals = sigma_df["sigma_shared"].dropna().unique()
+    if len(vals) != 1:
+        raise ValueError(f"sigma_shared must be one value across districts, got {vals}")
+    return float(vals[0])
 
 
 def estimate_district_sigma(
     targeting_df: pd.DataFrame,
     sigma_prior: float,
     config: SimConfig | None = None,
+    *,
+    sigma_shared: float,
 ) -> pd.DataFrame:
     """
     Compute per-district outcome uncertainty (sigma_i) using EB shrinkage.
@@ -109,12 +200,18 @@ def estimate_district_sigma(
     Parameters
     ----------
     targeting_df : DataFrame with columns: district, swing_sd, n_contested
-    sigma_prior : statewide prior std from compute_sigma_prior()
+    sigma_prior : within-year prior std from compute_sigma_prior()
     config : simulation config (for shrinkage weights)
+    sigma_shared : year-level shared std from compute_shared_sigma(). Required
+        (keyword-only) so no caller silently drops the shared component.
 
     Returns
     -------
-    DataFrame with columns: district, sigma_i, sigma_source
+    DataFrame with columns: district, sigma_i, sigma_source, sigma_shared,
+    sigma_total. sigma_i is the independent district noise; sigma_shared is
+    the same for every district and is drawn once per simulation;
+    sigma_total = sqrt(sigma_i^2 + sigma_shared^2) is each district's
+    marginal uncertainty at a known statewide environment.
     """
     if config is None:
         config = SimConfig()
@@ -136,6 +233,8 @@ def estimate_district_sigma(
             "district": int(row["district"]),
             "sigma_i": sigma_i,
             "sigma_source": source,
+            "sigma_shared": sigma_shared,
+            "sigma_total": np.sqrt(sigma_i**2 + sigma_shared**2),
         })
 
     return pd.DataFrame(rows)
@@ -182,29 +281,66 @@ def compute_incumbency_shifts(
 def run_simulations(
     targeting_df: pd.DataFrame,
     sigma_df: pd.DataFrame,
-    statewide_d: float,
+    statewide_d: float | np.ndarray,
     config: SimConfig | None = None,
 ) -> SimResult:
     """
-    Run N Monte Carlo simulations at a fixed statewide D share.
+    Run N Monte Carlo simulations of the chamber.
+
+    `statewide_d` is either:
+      - a scalar (e.g. 0.48) — a POINT simulation: every simulation uses the
+        same fixed environment, and only district-level noise varies. This
+        is the existing behavior (scenario tables, win-prob curves,
+        investment priority, defensive scenarios all use this mode) and its
+        results are unchanged by this parameter now accepting an array too.
+      - a 1-D array of pre-drawn environment samples (e.g. from
+        national_to_state.build_environment_prior(), or
+        governor.build_baseline_distribution()) — a DISTRIBUTION simulation:
+        each simulation draws its own statewide environment from the array
+        (one sample per simulation, in order) IN ADDITION to its own
+        district-level noise. This produces an UNCONDITIONAL seat
+        distribution that integrates over environment uncertainty, rather
+        than the conditional "if the environment is exactly X%" answer a
+        scalar gives. `config.n_sims` is ignored in this mode — the sample
+        count is set by `len(statewide_d)` so every environment draw is used
+        exactly once.
 
     For each simulation:
       1. Draw district-specific noise: epsilon_i ~ N(0, sigma_i)
       2. Optionally draw incumbency noise per sim
-      3. District D share = statewide_d + composite_lean_i + inc_i + epsilon_i
-      4. District goes D if d_share > 0.50
-      5. Count total D seats
+      3. Draw one shared year shift for all districts: eta ~ N(0, sigma_shared)
+         (skipped when sigma_shared is 0)
+      4. District D share = statewide_d + composite_lean_i + inc_i + eta + epsilon_i
+         (statewide_d is either the fixed scalar or that simulation's own
+         environment draw)
+      5. District goes D if d_share > 0.50
+      6. Count total D seats
 
     Parameters
     ----------
     targeting_df : must contain columns: district, composite_lean, current_holder,
                    incumbent_status_2026
-    sigma_df : from estimate_district_sigma(), columns: district, sigma_i
-    statewide_d : statewide D two-party share (e.g. 0.48)
+    sigma_df : from estimate_district_sigma(), columns: district, sigma_i, sigma_shared
+    statewide_d : statewide D two-party share (scalar) or an array of
+                  pre-drawn environment samples (distribution mode)
     config : simulation config
     """
     if config is None:
         config = SimConfig()
+
+    sw_arr = np.asarray(statewide_d, dtype=float)
+    if sw_arr.ndim == 0:
+        n_sims = config.n_sims
+        sw_col = sw_arr  # scalar broadcasts against (n_sims, n_districts) as-is
+        environment_samples = None
+    elif sw_arr.ndim == 1:
+        if sw_arr.size == 0:
+            raise ValueError("statewide_d array must be non-empty")
+        n_sims = sw_arr.size
+        sw_col = sw_arr[:, np.newaxis]
+        environment_samples = sw_arr.copy()
+    else:
+        raise ValueError(f"statewide_d must be a scalar or 1-D array, got shape {sw_arr.shape}")
 
     rng = np.random.default_rng(config.random_seed)
 
@@ -223,19 +359,27 @@ def run_simulations(
 
     # Monte Carlo draws
     # epsilon: (n_sims, n_districts)
-    epsilon = rng.normal(0.0, 1.0, size=(config.n_sims, n_districts)) * sigmas[np.newaxis, :]
+    epsilon = rng.normal(0.0, 1.0, size=(n_sims, n_districts)) * sigmas[np.newaxis, :]
 
     # Incumbency noise (if enabled, add per-sim noise around the literature value)
     if config.include_incumbency:
-        inc_noise = rng.normal(0.0, config.incumbency_sd, size=(config.n_sims, n_districts))
+        inc_noise = rng.normal(0.0, config.incumbency_sd, size=(n_sims, n_districts))
         # Only apply noise to districts with nonzero incumbency shift
         inc_mask = (inc_base != 0.0).astype(float)
         inc_total = inc_base[np.newaxis, :] + inc_noise * inc_mask[np.newaxis, :]
     else:
-        inc_total = np.zeros((config.n_sims, n_districts))
+        inc_total = np.zeros((n_sims, n_districts))
 
-    # District D share per simulation
-    d_shares = statewide_d + leans[np.newaxis, :] + inc_total + epsilon
+    # District D share per simulation (sw_col is either a scalar or shape
+    # (n_sims, 1) — both broadcast correctly against (n_sims, n_districts))
+    d_shares = sw_col + leans[np.newaxis, :] + inc_total + epsilon
+
+    # Shared year shift: one draw per simulation, applied to every district.
+    # Drawn last so a zero sigma_shared leaves the RNG stream (and results)
+    # identical to the independent-noise-only model.
+    shared_sigma = shared_sigma_of(sigma_df)
+    if shared_sigma > 0:
+        d_shares = d_shares + rng.normal(0.0, shared_sigma, size=(n_sims, 1))
 
     # D wins if d_share >= 0.50 (matches deterministic convention: flip_threshold <= sw_d)
     d_wins = d_shares >= 0.50
@@ -252,8 +396,8 @@ def run_simulations(
     seat_counts = d_wins.sum(axis=1)
 
     return SimResult(
-        statewide_d=statewide_d,
-        n_sims=config.n_sims,
+        statewide_d=float(sw_arr.mean()),
+        n_sims=n_sims,
         config=config,
         district_win_prob=district_wp,
         seat_counts=seat_counts,
@@ -264,6 +408,7 @@ def run_simulations(
         p75_seats=int(np.percentile(seat_counts, 75)),
         p90_seats=int(np.percentile(seat_counts, 90)),
         std_seats=float(seat_counts.std()),
+        environment_samples=environment_samples,
     )
 
 
@@ -336,15 +481,37 @@ def compute_analytical_win_probs(
     sigma_df: pd.DataFrame,
     statewide_d: float,
     config: SimConfig | None = None,
+    environment_sigma: float = 0.0,
 ) -> pd.DataFrame:
     """
     Compute per-district win probability and marginal WP analytically.
 
-    Uses the normal CDF: P(win) = Φ(margin / sigma_i)
-    Marginal WP = φ(margin / sigma_i) / sigma_i
+    Uses the normal CDF: P(win) = Φ(margin / total_sigma)
+    Marginal WP = φ(margin / total_sigma) / total_sigma
+    total_sigma = sqrt(sigma_i^2 + sigma_shared^2 + environment_sigma^2) —
+    the shared year shift is one draw for all districts, so marginally it
+    adds in quadrature like any other independent normal term.
+
+    `environment_sigma` defaults to 0.0 — the original behavior, treating
+    `statewide_d` as a known point (every existing caller: scenario tables,
+    win-prob curves, `build_investment_priority`, defensive scenarios). Pass
+    a nonzero value to instead treat `statewide_d` as the MEAN of an
+    uncertain environment (e.g. forecast_statewide.build_forecast()'s
+    blended posterior) and fold that uncertainty into the district's total
+    margin sigma: district margin = environment + composite_lean + inc_shift
+    + district noise, and environment ~ N(statewide_d, environment_sigma) is
+    independent of district noise ~ N(0, sigma_i), so their sum is exactly
+    Normal with sigma = sqrt(environment_sigma^2 + sigma_i^2) — no need for
+    per-simulation arrays to get this right. `total_sigma` replaces `sigma_i`
+    as the win-prob and marginal-wp denominator only when this is nonzero;
+    Returned columns are unchanged from before this parameter existed
+    (`sigma_i` is always the district-only value — the combined sigma is an
+    internal computation, not a new column) so every existing consumer's
+    output schema, including the documented `investment_priority.csv`, is
+    byte-identical at the default `environment_sigma=0.0`.
 
     Returns DataFrame: district, composite_lean, margin, sigma_i,
-        win_prob, marginal_wp
+        inc_shift, win_prob, marginal_wp
     """
     if config is None:
         config = SimConfig()
@@ -357,9 +524,12 @@ def compute_analytical_win_probs(
     merged["inc_shift"] = merged["district"].map(inc_shifts).fillna(0.0)
 
     merged["margin"] = statewide_d + merged["composite_lean"] + merged["inc_shift"] - 0.50
-    merged["z_score"] = merged["margin"] / merged["sigma_i"]
+    total_sigma = np.sqrt(
+        merged["sigma_i"]**2 + shared_sigma_of(sigma_df)**2 + environment_sigma**2
+    )
+    merged["z_score"] = merged["margin"] / total_sigma
     merged["win_prob"] = norm.cdf(merged["z_score"])
-    merged["marginal_wp"] = norm.pdf(merged["z_score"]) / merged["sigma_i"]
+    merged["marginal_wp"] = norm.pdf(merged["z_score"]) / total_sigma
 
     return merged[["district", "composite_lean", "margin", "sigma_i",
                     "inc_shift", "win_prob", "marginal_wp"]].copy()
@@ -595,7 +765,8 @@ def build_district_win_prob_table(
     Win probabilities for all 99 districts at every statewide environment.
 
     Returns DataFrame: district, statewide_d_pct, win_prob, sigma_i,
-        sigma_source, incumbency_shift
+        sigma_total, sigma_source, incumbency_shift. win_prob is computed with
+        sigma_total; sigma_i is the district-only part.
     """
     if config is None:
         config = SimConfig()
@@ -612,12 +783,13 @@ def build_district_win_prob_table(
 
         # Add sigma source and incumbency shift
         wp_merged = wp_df.merge(
-            sigma_df[["district", "sigma_source"]], on="district", how="left"
+            sigma_df[["district", "sigma_total", "sigma_source"]], on="district", how="left"
         )
         wp_merged["incumbency_shift"] = wp_merged["district"].map(inc_shifts).fillna(0.0)
 
         all_rows.append(wp_merged[["district", "statewide_d_pct", "win_prob",
-                                    "sigma_i", "sigma_source", "incumbency_shift"]])
+                                    "sigma_i", "sigma_total", "sigma_source",
+                                    "incumbency_shift"]])
 
     result = pd.concat(all_rows, ignore_index=True)
     result["win_prob"] = result["win_prob"].round(4)
