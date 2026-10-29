@@ -3582,6 +3582,22 @@ def _run_office_forecast(
     )
 
 
+@app.command("polls-refresh")
+def polls_refresh(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be added without writing"),
+):
+    """Merge new Ohio governor/Senate and national generic-ballot polls from VoteHub into data/polls/."""
+    from src.ingest_votehub import refresh_polls
+
+    reports = refresh_polls(write=not dry_run)
+    for rep in reports:
+        typer.echo(f"  {rep.file}: {rep.added_polls} new poll(s), {rep.duplicate_polls} already present")
+        for item in rep.added:
+            typer.echo(f"    + {item}")
+    typer.echo("\n  Dry run: nothing written." if dry_run else
+               "\n  Previous files copied to data/polls/archive/; raw VoteHub response in data/polls/votehub/.")
+
+
 @app.command("forecast-trend")
 def forecast_trend(
     office_name: str = typer.Option("house", "--office", help="house | senate | congress"),

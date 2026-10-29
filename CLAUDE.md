@@ -53,6 +53,10 @@ python cli.py backbone --full --force          # rebuild all cached parquets fro
 python cli.py trends                           # compute + merge into targeting CSV
 python cli.py trends --force                   # recompute from block vote surfaces
 
+# Poll refresh — merge new VoteHub polls (OH governor/Senate, national generic ballot)
+python cli.py polls-refresh --dry-run          # show what would be added
+python cli.py polls-refresh                    # merge, archiving the previous files
+
 # Session 12 — historical backtest (pre-2024 → predict 2024)
 python cli.py backtest                         # full out-of-sample backtest
 
@@ -1081,6 +1085,12 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 Polling data feeds the Phase B statewide forecast through `python cli.py forecast` / `<office> forecast` / `forecast-trend` (see below); the GUI does not use it yet. Files live in `data/polls/`. All three raw-poll files (`governor.csv`, `senate.csv`, `approval_polls.csv`) share the same schema — the standard 538/ABC-style raw polls feed, which several outlets (including the NYT/Upshot poll tracker) source from or contribute to. `The New York Times/Siena University` shows up as one pollster among many within this feed, not as a separate source — "NYT polling" is already inside these files, not a distinct integration.
 
 Refreshed 2026-09-11 (previous `governor.csv` archived at `data/polls/archive/governor_2663rows_pre2026-09.csv`; confirmed the new pull is a strict superset by `poll_id` before replacing).
+
+### VoteHub refresh (2026-10-29)
+
+`python cli.py polls-refresh [--dry-run]` (`src/ingest_votehub.py`) pulls VoteHub's open API (`https://api.votehub.com/polls`, no key) and **merges** into the existing files rather than replacing them: Ohio 2026 governor (`governor`) and Senate (`us-senator`) polls go into `governor.csv`/`senate.csv` in the 538 long schema, and national generic-ballot polls go into `generic_ballot.csv` in the Silver Bulletin schema. A new `feed` column records provenance (`538` / `silver_bulletin` / `votehub`); the 538 files' own `source` column is untouched. Dedup: same pollster (distinctive name tokens; whole name when every word is generic, e.g. Public Policy Polling) ending within 2 days, or within 10 days with toplines within 0.5. When VoteHub lists one poll per population, the LV version is kept. Re-running is idempotent. Each run archives changed files to `data/polls/archive/{name}_pre{YYYY-MM-DD_HHMM}.csv` and saves the raw response to `data/polls/votehub/`. VoteHub has no pollster grades, which loses nothing: every OH 2026 poll already lacked `numeric_grade`, and the generic ballot never used grades. nytimes.com can't be fetched from this environment; the NYT/Siena polls arrive through VoteHub.
+
+First run (2026-10-29): +13 OH governor polls (32 total, through 10/23), +14 OH Senate (33, through 10/23), +46 generic ballot (627, through 10/4). Signals: governor 50.0 → 51.8%, Senate raw 53.0 → 52.2% (48.5% after Brown's −3.7), fundamentals 47.3 → 47.7%. Blend 48.44% → 48.37% (± 2.0, floored); governor and Senate moves offset. House 40.1 seats [32, 48], P(≥34) 86.4%, P(majority) 5.8%. Senate (all-33 simulation) 12.8 [9, 17]. Congress 5.4 [3, 8], P(≥5) 66.0%.
 
 ### `data/polls/governor.csv` and `data/polls/senate.csv` — FiveThirtyEight-schema, all-state polls
 
