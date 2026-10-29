@@ -100,11 +100,22 @@ class RaceHeadline:
         return f"{d} {self.win_likelihood:.0%} · {r} {1 - self.win_likelihood:.0%}"
 
 
-def polling_average(race_key: str, as_of: pd.Timestamp | None = None) -> PollingAverage:
-    """Weighted raw toplines for one polled statewide race, same weights as the model."""
+def race_polls(race_key: str) -> pd.DataFrame:
+    """One row per poll for a polled statewide race: toplines, two-party share and metadata."""
     dem_name, rep_name = OHIO_2026_RACES[race_key]
     df = load_polls(POLLS / POLL_FILES[race_key], state="OH", cycle=2026, stage="general")
     polls = two_party_share(df, dem_name, rep_name)
+    meta_cols = [c for c in ("poll_id", "start_date", "feed", "url") if c in df.columns]
+    meta = df[meta_cols].drop_duplicates(subset="poll_id")
+    return polls.merge(meta, on="poll_id", how="left").sort_values("end_date", ascending=False)
+
+
+def polling_average(race_key: str, as_of: pd.Timestamp | None = None,
+                    polls: pd.DataFrame | None = None) -> PollingAverage:
+    """Weighted raw toplines for one polled statewide race, same weights as the model."""
+    dem_name, rep_name = OHIO_2026_RACES[race_key]
+    if polls is None:
+        polls = race_polls(race_key)
     used, w = poll_weights(
         polls, "dem_two_party", as_of=as_of or pd.Timestamp.now().normalize(),
         half_life_days=POLL_RECENCY_HALF_LIFE_DAYS, partisan_discount=POLL_PARTISAN_DISCOUNT,
@@ -129,6 +140,23 @@ def polling_average(race_key: str, as_of: pd.Timestamp | None = None) -> Polling
     )
 
 
+def polling_average_history(race_key: str, freq_days: int = 7, min_polls: int = 3) -> pd.DataFrame:
+    """
+    The polling average and its 80% margin band as they stood at each date,
+    using only polls finished by then (same weights as polling_average).
+    """
+    polls = race_polls(race_key)
+    end = min(pd.Timestamp.now().normalize(), pd.Timestamp("2026-11-03"))
+    start = polls["end_date"].sort_values().iloc[min(min_polls, len(polls)) - 1]
+    rows = []
+    for d in pd.date_range(start, end, freq=f"{freq_days}D").append(pd.DatetimeIndex([end])).unique():
+        pa = polling_average(race_key, d, polls=polls)
+        lo, hi = pa.margin_band80
+        rows.append({"date": d, "dem_pct": pa.dem_pct, "rep_pct": pa.rep_pct, "margin": pa.margin,
+                     "band_lo": lo, "band_hi": hi, "n_polls": pa.n_polls})
+    return pd.DataFrame(rows)
+
+
 def empty_frames() -> dict[str, pd.DataFrame]:
     """No returns entered: the pre-election forecast, regardless of what's in data/raw/."""
     from src.election_night import LEGISLATIVE_OFFICES, RETURN_COLUMNS
@@ -137,6 +165,25 @@ def empty_frames() -> dict[str, pd.DataFrame]:
         o: pd.DataFrame(columns=["race" if o == "statewide" else "district", *RETURN_COLUMNS])
         for o in ("statewide", *LEGISLATIVE_OFFICES)
     }
+
+
+def _feed_statewide_names() -> dict[str, tuple[str | None, str | None]]:
+    """Statewide nominees from the newest saved SOS feed file (row offices have no polls to name them)."""
+    from src.enr_feed import latest_feed_file, parse_feed
+
+    f = latest_feed_file()
+    if f is None:
+        return {}
+    try:
+        c = parse_feed(f).candidates
+    except Exception:  # noqa: BLE001 — names are cosmetic; never block a headline on a bad file
+        return {}
+    c = c[c["office"] == "statewide"]
+    out = {}
+    for key, grp in c.groupby("key"):
+        by = dict(zip(grp["party"], grp["name"].str.split().str.join(" ")))
+        out[key] = (by.get("D"), by.get("R"))
+    return out
 
 
 def statewide_headlines(result=None, *, as_of: pd.Timestamp | None = None) -> list[RaceHeadline]:
@@ -153,10 +200,11 @@ def statewide_headlines(result=None, *, as_of: pd.Timestamp | None = None) -> li
     poll_as_of = min(as_of or pd.Timestamp.now().normalize(), en.ELECTION_DAY)
 
     races = result.races.set_index("race_id")
+    ballot = _feed_statewide_names()
     out = []
     for sr in en.STATEWIDE_RACES:
         row = races.loc[f"statewide:{sr.key}"]
-        names = OHIO_2026_RACES.get(sr.key, (None, None))
+        names = OHIO_2026_RACES.get(sr.key) or ballot.get(sr.key, (None, None))
         polling = polling_average(sr.key, poll_as_of) if sr.key in POLL_FILES else None
         out.append(RaceHeadline(
             key=sr.key,

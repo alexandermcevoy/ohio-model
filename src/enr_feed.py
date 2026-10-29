@@ -237,6 +237,22 @@ def parse_feed(path: Path | str) -> FeedSnapshot:
     return snap
 
 
+def ballot_only(snap: FeedSnapshot) -> FeedSnapshot:
+    """
+    The snapshot's candidate list with every count removed: who is on the
+    ballot (and which races have only one major party) without any returns,
+    for the pre-election projection.
+    """
+    counties = snap.counties.copy()
+    counties[["precincts_reported", "ballots_total", "ballots_absentee"]] = 0
+    counties["count_status"] = "InProcess"
+    return FeedSnapshot(
+        generated=snap.generated, is_test=False, notes="", status="ballot_only", counties=counties,
+        statewide=snap.statewide.iloc[0:0], legislative=snap.legislative.iloc[0:0],
+        candidates=snap.candidates, source=snap.source, warnings=[],
+    )
+
+
 def self_check(snap: FeedSnapshot) -> str:
     """One line showing whether the fields the model depends on are populated."""
     c = snap.counties

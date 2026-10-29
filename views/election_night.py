@@ -1,9 +1,10 @@
 """
-Election Night — type in live returns, get a joint projection for every Ohio race.
+Election Night — live projection for every Ohio race from the Ohio SOS
+results feed (or manual entries as a fallback).
 
-Same computation as `python cli.py election-night` (src/election_night.py):
-returns are saved to data/raw/live_returns_oh_*.csv, so the CLI and this page
-always read the same numbers.
+Same computation as `python cli.py election-night --feed`
+(src/election_night.py); manual returns are saved to
+data/raw/live_returns_oh_*.csv, so the CLI and this page agree.
 """
 
 from __future__ import annotations
@@ -14,18 +15,19 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from gui.styles import HOLDER_COLORS, fmt_pct
+from gui.projection import model_day, prior_model
+from gui.styles import HOLDER_COLORS
 from src import election_night as en
 from src import enr_feed
 from src.headlines import statewide_headlines
 from src.office import get_office
 
-st.set_page_config(page_title="Election Night", page_icon=":ballot_box:", layout="wide")
-st.title("Election Night")
+st.title("Election night")
 st.caption(
-    "Enter vote totals as they come in (NYT, AP, VoteHub, county boards), then Save & recompute. "
-    "pct_reporting is the source's % of expected vote counted; leave it blank to estimate from 2022 turnout. "
-    "Tick final only when every vote is counted. Not a substitute for AP/network calls."
+    "Results come from the Ohio Secretary of State's live feed: every race, county by county. Click "
+    "**Refresh feed now** in the sidebar every few minutes. If the feed fails, switch the source to manual "
+    "entry and type totals from AP or NYT in the Enter returns tab. Checklist: ELECTION_NIGHT.md. "
+    "Not a substitute for AP/network calls."
 )
 
 OFFICE_TABS = [("statewide", "Statewide"), ("house", "Ohio House"), ("senate", "Ohio Senate"), ("congress", "US House")]
@@ -35,26 +37,21 @@ OFFICE_TABS = [("statewide", "Statewide"), ("house", "Ohio House"), ("senate", "
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.subheader("Election night settings")
-    early_skew = st.number_input(
-        "Early-count skew prior (D pts at 0% in)", value=0.0, step=1.0,
-        help="Expected D lean of the first ballots counted (early/absentee), relative to the final "
-             "result. The model also estimates this from the returns; this is only its starting point.",
-    )
+    st.subheader("Election night")
     source = st.radio("Results source", ["SOS live feed", "Manual entry only"], index=0,
                       help="The SOS feed covers every race county by county and wins over manual entries "
                            "for any race it has data for.")
     refresh = source == "SOS live feed" and st.button("Refresh feed now", type="primary")
-    n_sims = st.select_slider("Simulations", options=[2_000, 5_000, 10_000], value=5_000)
-    with_incumbency = st.checkbox("Literature incumbency adjustment", value=False)
+    with st.expander("Settings"):
+        n_sims = st.select_slider("Simulations", options=[2_000, 5_000, 10_000], value=5_000)
+        early_skew = st.number_input(
+            "Early-count skew prior (D pts at 0% in)", value=0.0, step=1.0,
+            help="Manual entries and the no-absentee-data fallback only: expected D lean of the first "
+                 "ballots counted, relative to the final result. The model also estimates it from the returns.",
+        )
+        with_incumbency = st.checkbox("Literature incumbency adjustment", value=False)
 
-
-@st.cache_resource(show_spinner="Building pre-election model…")
-def _model(day: str, skew: float, incumbency: bool) -> en.PriorModel:
-    return en.build_prior_model(pd.Timestamp(day), with_incumbency=incumbency, early_skew_mean=skew / 100)
-
-
-model = _model(str(en.prior_as_of().date()), early_skew, with_incumbency)
+model = prior_model(model_day(), early_skew, with_incumbency)
 en.ensure_return_files()
 
 # ---------------------------------------------------------------------------

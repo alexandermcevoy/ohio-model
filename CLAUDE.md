@@ -971,7 +971,7 @@ m[m["trend_dir"] == "trending_r"].sort_values("trend_slope")[
 - Streamlit multi-page dashboard in `gui/` package + `pages/` directory.
 - 5 pages: Scenario Explorer, Pickup Portfolio, District Profiles, Map (choropleth), Investment Priority.
 - Live recomputation via `src/simulate.py` when slider differs from reference environment.
-- `streamlit run app.py` launches the dashboard.
+- `streamlit run app.py` launches the dashboard. (Superseded 2026-10-29: see "Dashboard cleanup".)
 
 ### Session 12: Historical Backtest ✅
 - New module: `src/backtest.py`; new CLI command: `python cli.py backtest`
@@ -1095,6 +1095,18 @@ Rehearsal (`src/feed_rehearsal.py`, `election-night-rehearsal`) replays 2022 cou
 - **Takeaway:** first-hour ranges are reliable only if the night lands near the forecast.
 - `COUNTY_GAP_SD` (4.5 pts, county-to-county variation in the absentee gap) was set before measuring coverage and not tuned.
 - **Fallback when the feed has no absentee counts** (warning printed; uses the generic early-count skew): no wrong calls, but statewide ranges are biased ~2 pts at 20–60% counted (coverage 0%). Treat it as a degraded mode. The feed self-check line shows whether absentee counts are populated.
+
+### Dashboard cleanup (2026-10-29)
+
+`/usr/bin/python3 -m streamlit run app.py`. `app.py` is a router (`st.navigation`) with exactly four pages in `views/`:
+- **Current Projection** (home): statewide race cards, chambers (expected seats, win likelihood, seat distribution), closest legislative races.
+- **Polling Averages**: governor and Senate average over time with its 80% band, individual polls, a poll table, and the national generic ballot.
+- **Districts & Races**: every race by office in a sortable table, plus a full profile per district. The profile has the 2026 ballot from the feed, win likelihood, projected share, race-by-race leans, past results with a redistricting caveat, and House demographics. For statewide races it shows projected share by county.
+- **Election Night**: feed-first, with manual entry as fallback.
+
+All pages read one cached projection (`gui/projection.py`): the election-night model with no returns. Its only feed input is the newest SOS file's candidate list (`enr_feed.ballot_only`), which marks one-party races uncontested (HD 2, 4, 20, 22, 24, 25, 38 D; HD-97 and SD-1 R). That doesn't change any seat count. Statewide nominees without polls (row offices) are named from that same candidate list.
+
+Removed: Scenario Explorer, Pickup Portfolio, District Profiles, Map, Investment Priority and Trend Analysis pages, plus `gui/charts.py`, `gui/data_loader.py` and `gui/district_data.py`. The manual statewide-D% slider is gone from the app; `python cli.py scenario`/`win-prob` still answer "what if the environment is X%". The `export-gui` CLI command still writes `gui_data/`, which nothing reads now. `gui/compute.py` (the documented `classify_portfolio` definition) and `gui/styles.py` remain.
 
 ### Headline numbers: Polling Average + Win Likelihood (2026-10-29)
 
